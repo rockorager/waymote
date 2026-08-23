@@ -23,9 +23,10 @@ const stream_frame_metadata = 2;
 const stream_resize_applied = 3;
 const maximum_text_bytes = 4000;
 const minimum_width = 320;
-const maximum_width = 2560;
+const maximum_width = 6000;
 const minimum_height = 180;
-const maximum_height = 1440;
+const maximum_height = 6000;
+const maximum_pixels = maximum_width * maximum_height;
 const minimum_scale = 120;
 const maximum_scale = 480;
 const initial_audio_restart_delay_ms = 1000;
@@ -89,6 +90,7 @@ stride: u32 = 0,
 capture_format: ?wl.Shm.Format = null,
 constraints_received: bool = false,
 captured_once: bool = false,
+cursor_overlay: bool = false,
 acknowledged_keyframe_generation: u32 = 0,
 video_encoder: VideoEncoder,
 audio_encoder: ?std.process.Child = null,
@@ -338,6 +340,8 @@ fn readControl(self: *Stream) !void {
             consumed += payload_length;
         } else {
             const command = try RemoteInput.decodeRecord(&record);
+            const cursor_overlay = cursorOverlayForCommand(self.cursor_overlay, command);
+            if (cursor_overlay != self.cursor_overlay) try self.setCursorOverlay(cursor_overlay);
             self.remote_input.apply(command);
             if (record[1] != 5) {
                 self.latest_input_sequence = std.mem.readInt(u32, record[12..16], .little);
@@ -358,10 +362,31 @@ fn readControl(self: *Stream) !void {
 
 fn requestFrame(self: *Stream) !void {
     std.debug.assert(self.frame == null);
-    const frame = try self.manager.?.captureOutput(0, self.output.?);
+    const frame = try self.manager.?.captureOutput(@intFromBool(self.cursor_overlay), self.output.?);
     self.frame = frame;
     self.constraints_received = false;
     frame.setListener(*Stream, frameListener, self);
+}
+
+fn cursorOverlayForCommand(current: bool, command: RemoteInput.Command) bool {
+    return switch (command) {
+        .pointer_relative => true,
+        .pointer_motion, .release_all => false,
+        else => current,
+    };
+}
+
+fn setCursorOverlay(self: *Stream, enabled: bool) !void {
+    if (self.cursor_overlay == enabled) return;
+    self.cursor_overlay = enabled;
+    if (self.frame) |frame| {
+        frame.destroy();
+        self.frame = null;
+        self.constraints_received = false;
+        if (self.display.?.roundtrip() != .SUCCESS) return error.WaylandRoundtripFailed;
+    }
+    self.captured_once = false;
+    try self.requestFrame();
 }
 
 fn modeRequiresVideoGeneration(
@@ -861,7 +886,7 @@ fn decodeOutputMode(record: *const [RemoteInput.record_size]u8) !OutputMode {
     const scale = std.mem.readInt(u16, record[12..14], .little);
     if (width < minimum_width or width > maximum_width or width % 2 != 0 or
         height < minimum_height or height > maximum_height or height % 2 != 0 or
-        @as(u64, width) * height > maximum_width * maximum_height or
+        @as(u64, width) * height > maximum_pixels or
         scale < minimum_scale or scale > maximum_scale)
     {
         return error.InvalidOutputModeRecord;
@@ -1044,7 +1069,29 @@ test "output mode records decode bounded even dimensions and fractional scale" {
         try decodeOutputMode(&record),
     );
 
+    std.mem.writeInt(u32, record[4..8], 1696, .little);
+    std.mem.writeInt(u32, record[8..12], 2176, .little);
+    try std.testing.expectEqual(
+        OutputMode{ .width = 1696, .height = 2176, .scale = 180 },
+        try decodeOutputMode(&record),
+    );
+
+    std.mem.writeInt(u32, record[4..8], 6000, .little);
+    std.mem.writeInt(u32, record[8..12], 6000, .little);
+    try std.testing.expectEqual(
+        OutputMode{ .width = 6000, .height = 6000, .scale = 180 },
+        try decodeOutputMode(&record),
+    );
+
+    std.mem.writeInt(u32, record[4..8], 6002, .little);
+    try std.testing.expectError(error.InvalidOutputModeRecord, decodeOutputMode(&record));
+
+    std.mem.writeInt(u32, record[4..8], 6000, .little);
+    std.mem.writeInt(u32, record[8..12], 6002, .little);
+    try std.testing.expectError(error.InvalidOutputModeRecord, decodeOutputMode(&record));
+
     std.mem.writeInt(u32, record[4..8], 1919, .little);
+    std.mem.writeInt(u32, record[8..12], 1080, .little);
     try std.testing.expectError(error.InvalidOutputModeRecord, decodeOutputMode(&record));
 }
 
@@ -1057,6 +1104,23 @@ test "only captured pixel-size changes require a new video generation" {
     try std.testing.expect(!modeRequiresVideoGeneration(true, 1280, 720, current));
     try std.testing.expect(!modeRequiresVideoGeneration(true, 1280, 720, scaled));
     try std.testing.expect(modeRequiresVideoGeneration(true, 1280, 720, resized));
+}
+
+test "relative pointer input controls cursor compositing" {
+    const relative: RemoteInput.Command = .{
+        .pointer_relative = .{ .dx = 1, .dy = -1, .sequence = 1 },
+    };
+    const absolute: RemoteInput.Command = .{
+        .pointer_motion = .{ .x = 100, .y = 200, .sequence = 2 },
+    };
+    const key: RemoteInput.Command = .{
+        .keyboard_key = .{ .key = 30, .state = .pressed },
+    };
+
+    try std.testing.expect(cursorOverlayForCommand(false, relative));
+    try std.testing.expect(cursorOverlayForCommand(true, key));
+    try std.testing.expect(!cursorOverlayForCommand(true, absolute));
+    try std.testing.expect(!cursorOverlayForCommand(true, .release_all));
 }
 
 test "capture waits for damage only after current generation keyframe acknowledgement" {

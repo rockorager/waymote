@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { WaymoteSession } from "./waymote.js";
+import { WaymoteSession, __testing } from "./waymote.js";
 
 class FakeTarget {
   listeners = new Map();
@@ -24,6 +24,37 @@ class FakeTarget {
     return [...this.listeners.values()].reduce((count, listeners) => count + listeners.size, 0);
   }
 }
+
+test("observed resize supports tall displays without exceeding its pixel budget", () => {
+  const fitted = __testing.fitObservedResize(1922.5, 2467.5, {
+    maxPixels: 2560 * 1440,
+  });
+  assert.equal(fitted.width % 16, 0);
+  assert.equal(fitted.height % 16, 0);
+  assert.ok(fitted.width * fitted.height <= 2560 * 1440);
+  assert.ok(fitted.height > 1440);
+});
+
+test("observed resize accepts the 6000 square protocol envelope", () => {
+  assert.deepEqual(
+    __testing.fitObservedResize(6000, 6000, { maxPixels: 6000 * 6000 }),
+    { width: 6000, height: 6000, downscale: 1 },
+  );
+});
+
+test("observed resize clamps dimensions above the protocol envelope", () => {
+  const fitted = __testing.fitObservedResize(6002, 6002, { maxPixels: 6000 * 6000 });
+  assert.equal(fitted.width, 6000);
+  assert.equal(fitted.height, 6000);
+  assert.ok(fitted.downscale < 1);
+});
+
+test("fixed resize dimensions cannot exceed the protocol envelope", () => {
+  assert.deepEqual(
+    __testing.normalizeResizeDimensions(6002, 6002),
+    { width: 6000, height: 6000 },
+  );
+});
 
 test("session disposal is terminal, idempotent, and disposes its surface", async () => {
   const fakeWindow = new FakeTarget();

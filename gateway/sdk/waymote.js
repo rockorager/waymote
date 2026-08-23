@@ -1,5 +1,50 @@
 // Framework-independent browser SDK for a Waymote streaming gateway.
 const headerSize = 40;
+const automaticResizeAlignment = 16;
+const minimumOutputWidth = 320;
+const maximumOutputWidth = 6000;
+const minimumOutputHeight = 180;
+const maximumOutputHeight = 6000;
+const maximumOutputPixels = maximumOutputWidth * maximumOutputHeight;
+const defaultAutomaticOutputPixels = 3840 * 2160;
+
+function fitObservedResize(rawWidth, rawHeight, policy = {}) {
+  const minWidth = Math.min(maximumOutputWidth, policy.minWidth ?? minimumOutputWidth);
+  const minHeight = Math.min(maximumOutputHeight, policy.minHeight ?? minimumOutputHeight);
+  const maxWidth = Math.max(minWidth, Math.min(maximumOutputWidth,
+    policy.maxWidth ?? maximumOutputWidth));
+  const maxHeight = Math.max(minHeight, Math.min(maximumOutputHeight,
+    policy.maxHeight ?? maximumOutputHeight));
+  const maxPixels = Math.min(maximumOutputPixels,
+    policy.maxPixels ?? defaultAutomaticOutputPixels);
+  if (minWidth * minHeight > maxPixels) {
+    throw new RangeError("Remote display minimum size exceeds maxPixels");
+  }
+  const downscale = Math.min(
+    1,
+    maxWidth / rawWidth,
+    maxHeight / rawHeight,
+    Math.sqrt(maxPixels / (rawWidth * rawHeight)),
+  );
+  // Keep automatic video sizes on macroblock boundaries. Besides being broadly
+  // decoder-friendly, this prevents one- or two-pixel scrollbar/layout changes
+  // caused by presenting a resized frame from triggering an endless resize and
+  // encoder-restart loop.
+  const width = Math.max(minWidth, Math.min(maxWidth,
+    Math.floor(rawWidth * downscale / automaticResizeAlignment) * automaticResizeAlignment));
+  const height = Math.max(minHeight, Math.min(maxHeight,
+    Math.floor(rawHeight * downscale / automaticResizeAlignment) * automaticResizeAlignment));
+  return Object.freeze({ width, height, downscale });
+}
+
+function normalizeResizeDimensions(width, height) {
+  return Object.freeze({
+    width: Math.max(minimumOutputWidth,
+      Math.min(maximumOutputWidth, Math.round(width / 2) * 2)),
+    height: Math.max(minimumOutputHeight,
+      Math.min(maximumOutputHeight, Math.round(height / 2) * 2)),
+  });
+}
 
 function createRuntime(owner, options) {
 let display = null;
@@ -77,7 +122,6 @@ const controlKeyboardKey = 4;
 const controlReleaseAll = 5;
 const controlResize = 6;
 const controlPointerRelative = 8;
-const automaticResizeAlignment = 16;
 const maximumClipboardBytes = 1024 * 1024;
 const clipboardCopyTimeoutMilliseconds = 2000;
 const keyReleased = 0;
@@ -696,23 +740,7 @@ function sendResize() {
   const dpr = policy.devicePixelRatio ?? window.devicePixelRatio ?? 1;
   const rawWidth = bounds.width * dpr;
   const rawHeight = bounds.height * dpr;
-  const maxWidth = policy.maxWidth ?? 2560;
-  const maxHeight = policy.maxHeight ?? 1440;
-  const maxPixels = policy.maxPixels ?? 2560 * 1440;
-  const downscale = Math.min(
-    1,
-    maxWidth / rawWidth,
-    maxHeight / rawHeight,
-    Math.sqrt(maxPixels / (rawWidth * rawHeight)),
-  );
-  // Keep automatic video sizes on macroblock boundaries. Besides being broadly
-  // decoder-friendly, this prevents one- or two-pixel scrollbar/layout changes
-  // caused by presenting a resized frame from triggering an endless resize and
-  // encoder-restart loop.
-  const width = Math.max(policy.minWidth ?? 320, Math.min(maxWidth,
-    Math.round(rawWidth * downscale / automaticResizeAlignment) * automaticResizeAlignment));
-  const height = Math.max(policy.minHeight ?? 180, Math.min(maxHeight,
-    Math.round(rawHeight * downscale / automaticResizeAlignment) * automaticResizeAlignment));
+  const { width, height, downscale } = fitObservedResize(rawWidth, rawHeight, policy);
   const scale = Math.max(120, Math.min(480, Math.round(dpr * downscale * 120)));
   const previous = lastResizeRequest?.match(/^(\d+)x(\d+)@(\d+)$/);
   if (previous && Number(previous[3]) === scale &&
@@ -724,8 +752,7 @@ function sendResize() {
 }
 
 function sendResizeDimensions(width, height, scale) {
-  width = Math.max(320, Math.min(2560, Math.round(width / 2) * 2));
-  height = Math.max(180, Math.min(1440, Math.round(height / 2) * 2));
+  ({ width, height } = normalizeResizeDimensions(width, height));
   scale = Math.max(120, Math.min(480, Math.round(scale)));
   const request = `${width}x${height}@${scale}`;
   if (request === lastResizeRequest) {
@@ -2218,3 +2245,5 @@ export class WaymoteSession {
     }
   }
 }
+
+export const __testing = Object.freeze({ fitObservedResize, normalizeResizeDimensions });

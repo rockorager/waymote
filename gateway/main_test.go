@@ -493,16 +493,16 @@ func TestValidResizeControlRecord(t *testing.T) {
 		valid  bool
 	}{
 		{"minimum", makeControlRecord(controlResize, false, 320, 180, 120), true},
-		{"maximum", makeControlRecord(controlResize, false, 2560, 1440, 480), true},
+		{"tall retina viewport", makeControlRecord(controlResize, false, 1696, 2176, 264), true},
+		{"maximum", makeControlRecord(controlResize, false, 6000, 6000, 480), true},
 		{"typical fractional scale", makeControlRecord(controlResize, false, 1920, 1080, 150), true},
 		{"state set", makeControlRecord(controlResize, true, 1280, 720, 120), false},
 		{"odd width", makeControlRecord(controlResize, false, 1279, 720, 120), false},
 		{"odd height", makeControlRecord(controlResize, false, 1280, 719, 120), false},
 		{"width below minimum", makeControlRecord(controlResize, false, 318, 720, 120), false},
-		{"width above maximum", makeControlRecord(controlResize, false, 2562, 720, 120), false},
+		{"width above maximum", makeControlRecord(controlResize, false, 6002, 720, 120), false},
 		{"height below minimum", makeControlRecord(controlResize, false, 1280, 178, 120), false},
-		{"height above maximum", makeControlRecord(controlResize, false, 1280, 1442, 120), false},
-		{"too many pixels", makeControlRecord(controlResize, false, 2560, 1442, 120), false},
+		{"height above maximum", makeControlRecord(controlResize, false, 1280, 6002, 120), false},
 		{"scale below minimum", makeControlRecord(controlResize, false, 1280, 720, 119), false},
 		{"scale above maximum", makeControlRecord(controlResize, false, 1280, 720, 481), false},
 	}

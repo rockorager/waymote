@@ -65,6 +65,13 @@ const (
 	streamFrameMetadata    = 2
 	streamResizeApplied    = 3
 	maximumTextBytes       = 4000
+	minimumOutputWidth     = 320
+	maximumOutputWidth     = 6000
+	minimumOutputHeight    = 180
+	maximumOutputHeight    = 6000
+	maximumOutputPixels    = maximumOutputWidth * maximumOutputHeight
+	minimumOutputScale     = 120
+	maximumOutputScale     = 480
 )
 
 var version = "0.0.0-dev"
@@ -918,10 +925,11 @@ func validControlRecord(record []byte) bool {
 		return state == 0 && a == 0 && b == 0 && c == 0
 	case controlResize:
 		return state == 0 &&
-			a >= 320 && a <= 2560 && a%2 == 0 &&
-			b >= 180 && b <= 1440 && b%2 == 0 &&
-			uint64(a)*uint64(b) <= 2560*1440 &&
-			(c&0xffff) >= 120 && (c&0xffff) <= 480 && c>>16 != 0
+			a >= minimumOutputWidth && a <= maximumOutputWidth && a%2 == 0 &&
+			b >= minimumOutputHeight && b <= maximumOutputHeight && b%2 == 0 &&
+			uint64(a)*uint64(b) <= maximumOutputPixels &&
+			(c&0xffff) >= minimumOutputScale && (c&0xffff) <= maximumOutputScale &&
+			c>>16 != 0
 	default:
 		return false
 	}
@@ -973,10 +981,19 @@ func main() {
 		log.Fatal("bitrate must be between 100 and 200000 kbps")
 	}
 	if (*fixedWidth == 0) != (*fixedHeight == 0) ||
-		*fixedWidth != 0 && (*fixedWidth < 320 || *fixedWidth > 2560 || *fixedWidth%2 != 0 ||
-			*fixedHeight < 180 || *fixedHeight > 1440 || *fixedHeight%2 != 0 ||
-			uint64(*fixedWidth)*uint64(*fixedHeight) > 2560*1440) {
-		log.Fatal("fixed output size must be even, within 320x180 and 2560x1440, and at most 3686400 pixels")
+		*fixedWidth != 0 && (*fixedWidth < minimumOutputWidth ||
+			*fixedWidth > maximumOutputWidth || *fixedWidth%2 != 0 ||
+			*fixedHeight < minimumOutputHeight || *fixedHeight > maximumOutputHeight ||
+			*fixedHeight%2 != 0 ||
+			uint64(*fixedWidth)*uint64(*fixedHeight) > maximumOutputPixels) {
+		log.Fatalf(
+			"fixed output size must be even, within %dx%d and %dx%d, and at most %d pixels",
+			minimumOutputWidth,
+			minimumOutputHeight,
+			maximumOutputWidth,
+			maximumOutputHeight,
+			maximumOutputPixels,
+		)
 	}
 	if *xkbLayout == "" {
 		*xkbLayout = "us"
