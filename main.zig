@@ -27,6 +27,8 @@ const maximum_width = 6000;
 const minimum_height = 180;
 const maximum_height = 6000;
 const maximum_pixels = maximum_width * maximum_height;
+const maximum_h264_level_5_frame_macroblocks = 22_080;
+const maximum_h264_level_5_macroblocks_per_second = 589_824;
 const minimum_scale = 120;
 const maximum_scale = 480;
 const initial_audio_restart_delay_ms = 1000;
@@ -653,18 +655,43 @@ fn monotonicMilliseconds() u64 {
         @as(u64, @intCast(timestamp.nsec)) / std.time.ns_per_ms;
 }
 
+fn encodedDimensions(raw_width: u32, raw_height: u32, requested_scale: u32, frame_rate: u32) struct {
+    width: u16,
+    height: u16,
+} {
+    const maximum_macroblocks = @min(
+        maximum_h264_level_5_frame_macroblocks,
+        maximum_h264_level_5_macroblocks_per_second / frame_rate,
+    );
+    var scale = requested_scale;
+    while (true) : (scale -= 1) {
+        const width = @max(2, (raw_width * scale / 100) & ~@as(u32, 1));
+        const height = @max(2, (raw_height * scale / 100) & ~@as(u32, 1));
+        const macroblocks = (width + 15) / 16 * ((height + 15) / 16);
+        if (macroblocks <= maximum_macroblocks or scale == 1) {
+            return .{ .width = @intCast(width), .height = @intCast(height) };
+        }
+    }
+}
+
 fn submitFrame(self: *Stream) void {
     const mapping = self.mapping orelse return self.fail(error.MissingCaptureBuffer);
     var timestamp: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &timestamp);
     const capture_nanos: u64 = @as(u64, @intCast(timestamp.sec)) * std.time.ns_per_s +
         @as(u64, @intCast(timestamp.nsec));
+    const encoded = encodedDimensions(
+        self.width,
+        self.height,
+        self.options.encoded_scale,
+        self.options.frame_rate,
+    );
     const metadata: VideoEncoder.Metadata = .{
         .generation = self.generation,
         .raw_width = self.width,
         .raw_height = self.height,
-        .encoded_width = @intCast(@max(2, (self.width * self.options.encoded_scale / 100) & ~@as(u32, 1))),
-        .encoded_height = @intCast(@max(2, (self.height * self.options.encoded_scale / 100) & ~@as(u32, 1))),
+        .encoded_width = encoded.width,
+        .encoded_height = encoded.height,
         .capture_nanos = capture_nanos,
         .sequence = self.frame_sequence,
         .input_sequence = self.latest_input_sequence,
@@ -1104,6 +1131,32 @@ test "only captured pixel-size changes require a new video generation" {
     try std.testing.expect(!modeRequiresVideoGeneration(true, 1280, 720, current));
     try std.testing.expect(!modeRequiresVideoGeneration(true, 1280, 720, scaled));
     try std.testing.expect(modeRequiresVideoGeneration(true, 1280, 720, resized));
+}
+
+test "encoded dimensions stay within the advertised H.264 level" {
+    const tall_display = encodedDimensions(1696, 2176, 100, 30);
+    try std.testing.expectEqual(@as(u16, 1696), tall_display.width);
+    try std.testing.expectEqual(@as(u16, 2176), tall_display.height);
+
+    for ([_]struct { width: u32, height: u32, scale: u32, frame_rate: u32 }{
+        .{ .width = 3840, .height = 2160, .scale = 100, .frame_rate = 30 },
+        .{ .width = 6000, .height = 6000, .scale = 100, .frame_rate = 30 },
+        .{ .width = 6000, .height = 6000, .scale = 50, .frame_rate = 30 },
+        .{ .width = 1920, .height = 1080, .scale = 100, .frame_rate = 120 },
+    }) |requested| {
+        const encoded = encodedDimensions(
+            requested.width,
+            requested.height,
+            requested.scale,
+            requested.frame_rate,
+        );
+        const macroblocks = (@as(u32, encoded.width) + 15) / 16 *
+            ((@as(u32, encoded.height) + 15) / 16);
+        try std.testing.expect(macroblocks <= maximum_h264_level_5_frame_macroblocks);
+        try std.testing.expect(
+            macroblocks * requested.frame_rate <= maximum_h264_level_5_macroblocks_per_second,
+        );
+    }
 }
 
 test "relative pointer input controls cursor compositing" {
