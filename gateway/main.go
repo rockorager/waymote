@@ -355,7 +355,7 @@ func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
 	configuration, _ := json.Marshal(map[string]any{
 		"type":      "video-config",
 		"version":   protocolVersion,
-		"codec":     "avc1.42E032",
+		"codec":     "avc1.42E034",
 		"frameRate": g.frameRate,
 	})
 	if err := connection.Write(ctx, websocket.MessageText, configuration); err != nil {

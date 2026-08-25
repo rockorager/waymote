@@ -27,8 +27,8 @@ const maximum_width = 6000;
 const minimum_height = 180;
 const maximum_height = 6000;
 const maximum_pixels = maximum_width * maximum_height;
-const maximum_h264_level_5_frame_macroblocks = 22_080;
-const maximum_h264_level_5_macroblocks_per_second = 589_824;
+const maximum_h264_level_5_2_frame_macroblocks = 36_864;
+const maximum_h264_level_5_2_macroblocks_per_second = 2_073_600;
 const minimum_scale = 120;
 const maximum_scale = 480;
 const initial_audio_restart_delay_ms = 1000;
@@ -660,8 +660,8 @@ fn encodedDimensions(raw_width: u32, raw_height: u32, requested_scale: u32, fram
     height: u16,
 } {
     const maximum_macroblocks = @min(
-        maximum_h264_level_5_frame_macroblocks,
-        maximum_h264_level_5_macroblocks_per_second / frame_rate,
+        maximum_h264_level_5_2_frame_macroblocks,
+        maximum_h264_level_5_2_macroblocks_per_second / frame_rate,
     );
     var scale = requested_scale;
     while (true) : (scale -= 1) {
@@ -1138,6 +1138,16 @@ test "encoded dimensions stay within the advertised H.264 level" {
     try std.testing.expectEqual(@as(u16, 1696), tall_display.width);
     try std.testing.expectEqual(@as(u16, 2176), tall_display.height);
 
+    // A 2.5x-scaled 1107x1082 CSS viewport; needs level 5.2 to encode unscaled at 30 fps.
+    const dense_display = encodedDimensions(2768, 2704, 100, 30);
+    try std.testing.expectEqual(@as(u16, 2768), dense_display.width);
+    try std.testing.expectEqual(@as(u16, 2704), dense_display.height);
+
+    // 4K at 60 fps fits within level 5.2 without downscaling.
+    const uhd_display = encodedDimensions(3840, 2160, 100, 60);
+    try std.testing.expectEqual(@as(u16, 3840), uhd_display.width);
+    try std.testing.expectEqual(@as(u16, 2160), uhd_display.height);
+
     for ([_]struct { width: u32, height: u32, scale: u32, frame_rate: u32 }{
         .{ .width = 3840, .height = 2160, .scale = 100, .frame_rate = 30 },
         .{ .width = 6000, .height = 6000, .scale = 100, .frame_rate = 30 },
@@ -1152,9 +1162,9 @@ test "encoded dimensions stay within the advertised H.264 level" {
         );
         const macroblocks = (@as(u32, encoded.width) + 15) / 16 *
             ((@as(u32, encoded.height) + 15) / 16);
-        try std.testing.expect(macroblocks <= maximum_h264_level_5_frame_macroblocks);
+        try std.testing.expect(macroblocks <= maximum_h264_level_5_2_frame_macroblocks);
         try std.testing.expect(
-            macroblocks * requested.frame_rate <= maximum_h264_level_5_macroblocks_per_second,
+            macroblocks * requested.frame_rate <= maximum_h264_level_5_2_macroblocks_per_second,
         );
     }
 }

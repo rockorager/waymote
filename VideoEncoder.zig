@@ -445,7 +445,7 @@ fn startProcess(self: *VideoEncoder, config: Config, generation: u32, ssrc: u32)
         "-profile:v",
         "baseline",
         "-level:v",
-        "5.0",
+        "5.2",
         "-pix_fmt",
         "yuv420p",
         "-b:v",
