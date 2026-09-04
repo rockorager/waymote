@@ -1547,6 +1547,7 @@ async function connectVideo() {
   }
   videoConnectAttempt = null;
   videoSocket = socket;
+  let decoderSetup = Promise.resolve();
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
     if (videoSocket !== socket) return;
@@ -1558,7 +1559,7 @@ async function connectVideo() {
     if (typeof event.data === "string") {
       const message = JSON.parse(event.data);
       if (message.type === "video-config") {
-        configureDecoder(message).catch((error) => {
+        decoderSetup = configureDecoder(message).catch((error) => {
           if (videoSocket !== socket || sessionDisposed || !sessionConnected) return;
           console.error("video decoder configuration failed", error);
           setStatus("Video decoder error");
@@ -1567,7 +1568,11 @@ async function connectVideo() {
       }
       return;
     }
-    decodeMessage(event.data);
+    const data = event.data;
+    void decoderSetup.then(() => {
+      if (videoSocket !== socket || sessionDisposed || !sessionConnected) return;
+      decodeMessage(data);
+    });
   });
   socket.addEventListener("close", (event) => {
     if (videoSocket !== socket) return;
