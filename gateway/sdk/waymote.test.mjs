@@ -277,6 +277,117 @@ test("disconnect invalidates an in-flight audio decoder setup", async () => {
   await session.dispose();
 });
 
+test("video keyframes wait for decoder setup and reject stale sessions", async () => {
+  const fakeWindow = new FakeTarget();
+  fakeWindow.devicePixelRatio = 1;
+  fakeWindow.VideoDecoder = true;
+  const fakeDocument = new FakeTarget();
+  fakeDocument.hidden = false;
+  globalThis.window = fakeWindow;
+  globalThis.document = fakeDocument;
+
+  class FakeWebSocket extends FakeTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    readyState = FakeWebSocket.CONNECTING;
+    binaryType = "";
+    send() {}
+    close() { this.readyState = FakeWebSocket.CLOSED; }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+
+  const supportResolvers = [];
+  let decoderConstructions = 0;
+  let decodedFrames = 0;
+  globalThis.VideoDecoder = class {
+    static isConfigSupported() {
+      return new Promise((resolve) => supportResolvers.push(resolve));
+    }
+
+    state = "unconfigured";
+    decodeQueueSize = 0;
+
+    constructor({ output }) {
+      decoderConstructions += 1;
+      this.output = output;
+    }
+
+    configure() { this.state = "configured"; }
+    reset() { this.state = "unconfigured"; }
+    close() { this.state = "closed"; }
+    decode(chunk) {
+      decodedFrames += 1;
+      this.output({
+        timestamp: chunk.timestamp,
+        displayWidth: 1280,
+        displayHeight: 720,
+        close() {},
+      });
+    }
+  };
+  globalThis.EncodedVideoChunk = class {
+    constructor(init) { Object.assign(this, init); }
+  };
+  globalThis.requestAnimationFrame = (callback) => {
+    queueMicrotask(callback);
+    return 1;
+  };
+  globalThis.cancelAnimationFrame = () => {};
+
+  const sockets = new Map();
+  const canvas = new FakeTarget();
+  canvas.width = 1280;
+  canvas.height = 720;
+  let renderedFrames = 0;
+  canvas.getContext = () => ({ drawImage() { renderedFrames += 1; } });
+  canvas.focus = () => {};
+  const textInput = new FakeTarget();
+  textInput.value = "";
+  textInput.focus = () => {};
+  const session = new WaymoteSession({
+    endpoint: "https://desktop.example.com",
+    audio: false,
+    createWebSocket(path) {
+      const socket = new FakeWebSocket();
+      sockets.set(path, socket);
+      return socket;
+    },
+  });
+  session.attachSurface({ canvas, textInputElement: textInput });
+  session.connect();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const videoSocket = sockets.get("/stream");
+  const keyframe = new ArrayBuffer(41);
+  const view = new DataView(keyframe);
+  view.setUint8(0, 2);
+  view.setUint8(1, 1);
+  view.setUint8(2, 1);
+  videoSocket.dispatch("message", {
+    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
+  });
+  videoSocket.dispatch("message", { data: keyframe });
+  assert.equal(decodedFrames, 0);
+
+  supportResolvers.shift()({ supported: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(decodedFrames, 1);
+  assert.equal(renderedFrames, 1);
+
+  videoSocket.dispatch("message", {
+    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
+  });
+  videoSocket.dispatch("message", { data: keyframe });
+  session.disconnect();
+  supportResolvers.shift()({ supported: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(decoderConstructions, 1);
+  assert.equal(decodedFrames, 1);
+  await session.dispose();
+});
+
 test("audio-disabled sessions use the socket factory only for video and control", async () => {
   const fakeWindow = new FakeTarget();
   fakeWindow.devicePixelRatio = 1;
