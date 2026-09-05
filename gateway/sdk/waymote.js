@@ -1547,7 +1547,23 @@ async function connectVideo() {
   }
   videoConnectAttempt = null;
   videoSocket = socket;
-  let decoderSetup = Promise.resolve();
+  let pendingDecoderMessages = null;
+  function queuePendingDecoderMessage(data) {
+    if (!(data instanceof ArrayBuffer) || data.byteLength < headerSize) return;
+    const view = new DataView(data);
+    if (view.getUint8(0) !== 2 || view.getUint8(1) !== 1) return;
+    const keyframe = (view.getUint8(2) & 1) !== 0;
+    const discontinuity = (view.getUint8(2) & 2) !== 0;
+    if (keyframe || discontinuity) {
+      pendingDecoderMessages.length = 0;
+    }
+    if (!keyframe && !discontinuity && pendingDecoderMessages.length === 0) return;
+    if (pendingDecoderMessages.length >= 6) {
+      pendingDecoderMessages.length = 0;
+      return;
+    }
+    pendingDecoderMessages.push(data);
+  }
   socket.binaryType = "arraybuffer";
   socket.addEventListener("open", () => {
     if (videoSocket !== socket) return;
@@ -1559,7 +1575,19 @@ async function connectVideo() {
     if (typeof event.data === "string") {
       const message = JSON.parse(event.data);
       if (message.type === "video-config") {
-        decoderSetup = configureDecoder(message).catch((error) => {
+        const messages = [];
+        pendingDecoderMessages = messages;
+        configureDecoder(message).then(() => {
+          if (videoSocket !== socket || sessionDisposed || !sessionConnected ||
+              pendingDecoderMessages !== messages) return;
+          pendingDecoderMessages = null;
+          for (const data of messages) {
+            decodeMessage(data);
+          }
+        }).catch((error) => {
+          if (pendingDecoderMessages === messages) {
+            pendingDecoderMessages = null;
+          }
           if (videoSocket !== socket || sessionDisposed || !sessionConnected) return;
           console.error("video decoder configuration failed", error);
           setStatus("Video decoder error");
@@ -1568,14 +1596,15 @@ async function connectVideo() {
       }
       return;
     }
-    const data = event.data;
-    void decoderSetup.then(() => {
-      if (videoSocket !== socket || sessionDisposed || !sessionConnected) return;
-      decodeMessage(data);
-    });
+    if (pendingDecoderMessages) {
+      queuePendingDecoderMessage(event.data);
+    } else {
+      decodeMessage(event.data);
+    }
   });
   socket.addEventListener("close", (event) => {
     if (videoSocket !== socket) return;
+    pendingDecoderMessages = null;
     videoSocket = null;
     const reason = event.reason || `WebSocket code ${event.code}`;
     console.warn("video WebSocket closed", event.code, event.reason);
