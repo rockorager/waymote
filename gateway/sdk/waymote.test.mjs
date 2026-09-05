@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import { WaymoteSession, __testing } from "./waymote.js";
 
@@ -388,7 +390,7 @@ test("video keyframes wait for decoder setup and reject stale sessions", async (
   await session.dispose();
 });
 
-test("video decoder setup retains only the latest bounded frame group", async () => {
+async function pendingVideoSetup(t) {
   const fakeWindow = new FakeTarget();
   fakeWindow.devicePixelRatio = 1;
   fakeWindow.VideoDecoder = true;
@@ -408,11 +410,12 @@ test("video decoder setup retains only the latest bounded frame group", async ()
   }
   globalThis.WebSocket = FakeWebSocket;
 
-  let resolveSupport;
-  const support = new Promise((resolve) => { resolveSupport = resolve; });
+  const setups = [];
   const decodedTimestamps = [];
   globalThis.VideoDecoder = class {
-    static isConfigSupported() { return support; }
+    static isConfigSupported() {
+      return new Promise((resolve, reject) => setups.push({ resolve, reject }));
+    }
     state = "unconfigured";
     decodeQueueSize = 0;
     configure() { this.state = "configured"; }
@@ -443,11 +446,11 @@ test("video decoder setup retains only the latest bounded frame group", async ()
     },
   });
   session.attachSurface({ canvas, textInputElement: textInput });
+  t.after(() => session.dispose());
   session.connect();
   await Promise.resolve();
   await Promise.resolve();
 
-  const videoSocket = sockets.get("/stream");
   const message = (timestamp, flags = 0) => {
     const buffer = new ArrayBuffer(41);
     const view = new DataView(buffer);
@@ -457,9 +460,18 @@ test("video decoder setup retains only the latest bounded frame group", async ()
     view.setBigUint64(12, BigInt(timestamp), true);
     return buffer;
   };
-  videoSocket.dispatch("message", {
+  const configure = (socket = sockets.get("/stream")) => socket.dispatch("message", {
     data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
   });
+  configure();
+  return { session, sockets, setups, decodedTimestamps, message, configure };
+}
+
+const settleVideoSetup = () => new Promise((resolve) => setImmediate(resolve));
+
+test("video decoder setup retains only the latest bounded frame group", async (t) => {
+  const { sockets, setups, decodedTimestamps, message } = await pendingVideoSetup(t);
+  const videoSocket = sockets.get("/stream");
   videoSocket.dispatch("message", { data: message(1) });
   videoSocket.dispatch("message", { data: message(2, 1) });
   for (let timestamp = 3; timestamp <= 8; timestamp += 1) {
@@ -469,10 +481,117 @@ test("video decoder setup retains only the latest bounded frame group", async ()
   videoSocket.dispatch("message", { data: message(10, 1) });
   videoSocket.dispatch("message", { data: message(11) });
 
-  resolveSupport({ supported: true });
-  await new Promise((resolve) => setImmediate(resolve));
+  setups[0].resolve({ supported: true });
+  await settleVideoSetup();
   assert.deepEqual(decodedTimestamps, [10, 11]);
-  await session.dispose();
+});
+
+for (const [name, flags, expected] of [
+  ["exactly six contiguous frames", [1, 0, 0, 0, 0, 0], [0, 1, 2, 3, 4, 5]],
+  ["overflow before another boundary", [1, 0, 0, 0, 0, 0, 0, 0], []],
+  ["leading deltas", [0, 0], []],
+  ["a replacement keyframe", [1, 0, 1, 0], [2, 3]],
+  ["a discontinuity keyframe", [1, 0, 3, 0], [2, 3]],
+  ["a discontinuity without a keyframe", [1, 0, 2, 0], []],
+]) {
+  test(`video decoder setup handles ${name}`, async (t) => {
+    const { sockets, setups, decodedTimestamps, message } = await pendingVideoSetup(t);
+    const socket = sockets.get("/stream");
+    flags.forEach((flag, timestamp) => socket.dispatch("message", { data: message(timestamp, flag) }));
+    setups[0].resolve({ supported: true });
+    await settleVideoSetup();
+    assert.deepEqual(decodedTimestamps, expected);
+    // Live messages must follow the buffered group, not remain queued after setup.
+    socket.dispatch("message", { data: message(100, 1) });
+    assert.deepEqual(decodedTimestamps, [...expected, 100]);
+  });
+}
+
+test("video setup rejection closes only the current socket", async (t) => {
+  const { session, sockets, setups, decodedTimestamps, message, configure } = await pendingVideoSetup(t);
+  const oldSocket = sockets.get("/stream");
+  oldSocket.dispatch("message", { data: message(1, 1) });
+  session.disconnect();
+  session.connect();
+  await settleVideoSetup();
+  const socket = sockets.get("/stream");
+  configure();
+  socket.dispatch("message", { data: message(2, 1) });
+  // A delayed close/rejection from the old socket must not clear the new queue.
+  oldSocket.dispatch("close", { code: 1000 });
+  setups[0].reject(new Error("stale setup"));
+  setups[1].resolve({ supported: true });
+  await settleVideoSetup();
+  assert.deepEqual(decodedTimestamps, [2]);
+  assert.notEqual(socket.readyState, WebSocket.CLOSED);
+
+  configure();
+  socket.dispatch("message", { data: message(3, 1) });
+  t.mock.method(console, "error", () => {});
+  setups[2].reject(new Error("current setup"));
+  await settleVideoSetup();
+  assert.equal(socket.readyState, WebSocket.CLOSED);
+  assert.deepEqual(decodedTimestamps, [2]);
+});
+
+test("superseded video setup cannot flush or close the current setup", async (t) => {
+  const { sockets, setups, decodedTimestamps, message, configure } = await pendingVideoSetup(t);
+  const socket = sockets.get("/stream");
+  socket.dispatch("message", { data: message(1, 1) });
+  configure();
+  socket.dispatch("message", { data: message(2, 1) });
+  configure();
+  socket.dispatch("message", { data: message(3, 1) });
+  setups[2].resolve({ supported: true });
+  await settleVideoSetup();
+  setups[0].resolve({ supported: true });
+  setups[1].reject(new Error("superseded setup"));
+  await settleVideoSetup();
+  assert.deepEqual(decodedTimestamps, [3]);
+  assert.notEqual(socket.readyState, WebSocket.CLOSED);
+});
+
+test("pending video buffers are released before setup settles", async (t) => {
+  if (!globalThis.gc) {
+    const env = { ...process.env };
+    delete env.NODE_TEST_CONTEXT;
+    const output = execFileSync(process.execPath, [
+      "--expose-gc", "--test", "--test-reporter=tap",
+      "--test-name-pattern=^pending video buffers are released before setup settles$",
+      fileURLToPath(import.meta.url),
+    ], { env, encoding: "utf8", timeout: 30_000 });
+    assert.match(output, /# pass 5\b/);
+    return;
+  }
+  for (const action of ["close", "disconnect", "dispose", "replace"]) {
+    await t.test(action, async (t) => {
+      const { session, sockets, setups, message, configure } = await pendingVideoSetup(t);
+      const socket = sockets.get("/stream");
+      const enqueue = (timestamp) => {
+        const buffer = message(timestamp, timestamp === 0 ? 1 : 0);
+        socket.dispatch("message", { data: buffer });
+        return new WeakRef(buffer);
+      };
+      const refs = Array.from({ length: 6 }, (_, timestamp) => enqueue(timestamp));
+      if (action === "close") {
+        document.hidden = true; // Do not schedule a reconnect during this check.
+        t.mock.method(console, "warn", () => {});
+        socket.dispatch("close", { code: 1000 });
+      } else if (action === "replace") {
+        configure();
+      } else {
+        await session[action]();
+      }
+      // Keep the setup promise reachable and pending while testing collection.
+      for (let i = 0; i < 5; i++) {
+        await settleVideoSetup();
+        globalThis.gc();
+      }
+      assert.ok(refs.every((ref) => ref.deref() === undefined), `${action} retained frame buffers`);
+      setups.forEach(({ resolve }) => resolve({ supported: true }));
+      await settleVideoSetup();
+    });
+  }
 });
 
 test("audio-disabled sessions use the socket factory only for video and control", async () => {

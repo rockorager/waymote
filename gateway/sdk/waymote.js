@@ -63,6 +63,7 @@ let disposePromise = null;
 
 let decoder = null;
 let videoSocket = null;
+let pendingDecoderMessages = null;
 const pendingFrames = [];
 let animationPending = false;
 let animationFrame = null;
@@ -1512,6 +1513,11 @@ function sendFeedback() {
   intervalChunks = 0;
 }
 
+function clearPendingDecoderMessages() {
+  if (pendingDecoderMessages) pendingDecoderMessages.length = 0;
+  pendingDecoderMessages = null;
+}
+
 async function connectVideo() {
   if (!sessionConnected || document.hidden) return;
   if (videoReconnectTimer !== null) {
@@ -1547,7 +1553,6 @@ async function connectVideo() {
   }
   videoConnectAttempt = null;
   videoSocket = socket;
-  let pendingDecoderMessages = null;
   function queuePendingDecoderMessage(data) {
     if (!(data instanceof ArrayBuffer) || data.byteLength < headerSize) return;
     const view = new DataView(data);
@@ -1575,20 +1580,20 @@ async function connectVideo() {
     if (typeof event.data === "string") {
       const message = JSON.parse(event.data);
       if (message.type === "video-config") {
+        clearPendingDecoderMessages();
         const messages = [];
         pendingDecoderMessages = messages;
         configureDecoder(message).then(() => {
           if (videoSocket !== socket || sessionDisposed || !sessionConnected ||
               pendingDecoderMessages !== messages) return;
-          pendingDecoderMessages = null;
           for (const data of messages) {
             decodeMessage(data);
           }
+          if (pendingDecoderMessages === messages) clearPendingDecoderMessages();
         }).catch((error) => {
-          if (pendingDecoderMessages === messages) {
-            pendingDecoderMessages = null;
-          }
-          if (videoSocket !== socket || sessionDisposed || !sessionConnected) return;
+          if (videoSocket !== socket || sessionDisposed || !sessionConnected ||
+              pendingDecoderMessages !== messages) return;
+          clearPendingDecoderMessages();
           console.error("video decoder configuration failed", error);
           setStatus("Video decoder error");
           socket.close(4001, "video decoder configuration failed");
@@ -1604,7 +1609,7 @@ async function connectVideo() {
   });
   socket.addEventListener("close", (event) => {
     if (videoSocket !== socket) return;
-    pendingDecoderMessages = null;
+    clearPendingDecoderMessages();
     videoSocket = null;
     const reason = event.reason || `WebSocket code ${event.code}`;
     console.warn("video WebSocket closed", event.code, event.reason);
@@ -1969,6 +1974,7 @@ function disconnect() {
   const wasConnected = sessionConnected;
   sessionConnected = false;
   connectionGeneration += 1;
+  clearPendingDecoderMessages();
   controlConnectAttempt = null;
   videoConnectAttempt = null;
   audioConnectAttempt = null;
