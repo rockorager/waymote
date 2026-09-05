@@ -388,6 +388,93 @@ test("video keyframes wait for decoder setup and reject stale sessions", async (
   await session.dispose();
 });
 
+test("video decoder setup retains only the latest bounded frame group", async () => {
+  const fakeWindow = new FakeTarget();
+  fakeWindow.devicePixelRatio = 1;
+  fakeWindow.VideoDecoder = true;
+  const fakeDocument = new FakeTarget();
+  fakeDocument.hidden = false;
+  globalThis.window = fakeWindow;
+  globalThis.document = fakeDocument;
+
+  class FakeWebSocket extends FakeTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    readyState = FakeWebSocket.CONNECTING;
+    binaryType = "";
+    send() {}
+    close() { this.readyState = FakeWebSocket.CLOSED; }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+
+  let resolveSupport;
+  const support = new Promise((resolve) => { resolveSupport = resolve; });
+  const decodedTimestamps = [];
+  globalThis.VideoDecoder = class {
+    static isConfigSupported() { return support; }
+    state = "unconfigured";
+    decodeQueueSize = 0;
+    configure() { this.state = "configured"; }
+    reset() { this.state = "unconfigured"; }
+    close() { this.state = "closed"; }
+    decode(chunk) { decodedTimestamps.push(chunk.timestamp); }
+  };
+  globalThis.EncodedVideoChunk = class {
+    constructor(init) { Object.assign(this, init); }
+  };
+
+  const sockets = new Map();
+  const canvas = new FakeTarget();
+  canvas.width = 1280;
+  canvas.height = 720;
+  canvas.getContext = () => ({ drawImage() {} });
+  canvas.focus = () => {};
+  const textInput = new FakeTarget();
+  textInput.value = "";
+  textInput.focus = () => {};
+  const session = new WaymoteSession({
+    endpoint: "https://desktop.example.com",
+    audio: false,
+    createWebSocket(path) {
+      const socket = new FakeWebSocket();
+      sockets.set(path, socket);
+      return socket;
+    },
+  });
+  session.attachSurface({ canvas, textInputElement: textInput });
+  session.connect();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const videoSocket = sockets.get("/stream");
+  const message = (timestamp, flags = 0) => {
+    const buffer = new ArrayBuffer(41);
+    const view = new DataView(buffer);
+    view.setUint8(0, 2);
+    view.setUint8(1, 1);
+    view.setUint8(2, flags);
+    view.setBigUint64(12, BigInt(timestamp), true);
+    return buffer;
+  };
+  videoSocket.dispatch("message", {
+    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
+  });
+  videoSocket.dispatch("message", { data: message(1) });
+  videoSocket.dispatch("message", { data: message(2, 1) });
+  for (let timestamp = 3; timestamp <= 8; timestamp += 1) {
+    videoSocket.dispatch("message", { data: message(timestamp) });
+  }
+  videoSocket.dispatch("message", { data: message(9) });
+  videoSocket.dispatch("message", { data: message(10, 1) });
+  videoSocket.dispatch("message", { data: message(11) });
+
+  resolveSupport({ supported: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(decodedTimestamps, [10, 11]);
+  await session.dispose();
+});
+
 test("audio-disabled sessions use the socket factory only for video and control", async () => {
   const fakeWindow = new FakeTarget();
   fakeWindow.devicePixelRatio = 1;
