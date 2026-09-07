@@ -1159,7 +1159,8 @@ function handleKeyDown(event) {
   if (key === undefined) {
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.code === "KeyV") {
+  const altGraph = event.getModifierState?.("AltGraph") === true;
+  if (!altGraph && (event.ctrlKey || event.metaKey) && event.code === "KeyV") {
     if (!event.repeat && !clipboardPastePending) {
       clipboardPastePending = true;
       const modifiers = shortcutModifiers(event);
@@ -1177,7 +1178,7 @@ function handleKeyDown(event) {
     event.stopPropagation();
     return;
   }
-  if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.code === "KeyC") {
+  if (!altGraph && (event.ctrlKey || event.metaKey) && event.shiftKey && event.code === "KeyC") {
     if (!event.repeat) {
       armShortcutClipboardCopy();
       reserveRemoteClipboardCopy();
@@ -1195,7 +1196,11 @@ function handleKeyDown(event) {
       supportsResolvedKeysyms ? resolvedKeysym(event) : 0,
     ));
   } else if (event.repeat) {
-    sendControl(keyboardRecord(key, keyRepeated));
+    sendControl(keyboardRecord(
+      key,
+      keyRepeated,
+      supportsResolvedKeysyms ? resolvedKeysym(event) : 0,
+    ));
   }
   physicalTextPending = event.key?.length === 1 && !event.ctrlKey && !event.metaKey;
   event.preventDefault();

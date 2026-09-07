@@ -134,7 +134,7 @@ test("keyboard records use resolved keysyms only when the gateway advertises sup
   const controlSocket = sockets.get("/control");
   controlSocket.readyState = FakeWebSocket.OPEN;
   controlSocket.dispatch("open", {});
-  const keyEvent = (type, key) => canvas.dispatch(type, {
+  const keyEvent = (type, key, overrides = {}) => canvas.dispatch(type, {
     code: "KeyQ",
     key,
     ctrlKey: false,
@@ -146,6 +146,7 @@ test("keyboard records use resolved keysyms only when the gateway advertises sup
     getModifierState: () => false,
     preventDefault() {},
     stopPropagation() {},
+    ...overrides,
   });
 
   controlSocket.dispatch("message", {
@@ -165,6 +166,67 @@ test("keyboard records use resolved keysyms only when the gateway advertises sup
   const records = controlSocket.sent.filter((value) => value instanceof ArrayBuffer);
   assert.equal(new DataView(records[0]).getUint32(8, true), 0);
   assert.equal(new DataView(records[2]).getUint32(8, true), 0x27);
+  keyEvent("keyup", "'");
+
+  const keyboardRecords = () => controlSocket.sent.map((record) => {
+    assert.ok(record instanceof ArrayBuffer, "keyboard input must not invoke clipboard control");
+    const view = new DataView(record);
+    assert.equal(view.getUint8(1), 4);
+    return [view.getUint32(4, true), view.getUint8(2), view.getUint32(8, true)];
+  });
+
+  await t.test("repeat follows Shift release without releasing the printable key", () => {
+    controlSocket.sent.length = 0;
+    keyEvent("keydown", "Shift", { code: "ShiftLeft", shiftKey: true });
+    keyEvent("keydown", "@", { code: "Digit2", shiftKey: true });
+    keyEvent("keydown", "@", { code: "Digit2", shiftKey: true, repeat: true });
+    keyEvent("keyup", "Shift", { code: "ShiftLeft" });
+    keyEvent("keydown", "2", { code: "Digit2", repeat: true });
+    keyEvent("keyup", "2", { code: "Digit2" });
+    assert.deepEqual(keyboardRecords(), [
+      [42, 1, 0], [3, 1, 0x40], [3, 2, 0x40], [42, 0, 0], [3, 2, 0x32], [3, 0, 0],
+    ]);
+  });
+
+  await t.test("AltGraph characters bypass both clipboard shortcut handlers", async () => {
+    controlSocket.sent.length = 0;
+    const altGraph = {
+      ctrlKey: true,
+      altKey: true,
+      getModifierState: (name) => name === "AltGraph",
+    };
+    keyEvent("keydown", "@", { ...altGraph, code: "KeyV" });
+    keyEvent("keydown", "@", { ...altGraph, code: "KeyV", repeat: true });
+    keyEvent("keyup", "@", { ...altGraph, code: "KeyV" });
+    keyEvent("keydown", "Ć", { ...altGraph, code: "KeyC", shiftKey: true });
+    keyEvent("keyup", "Ć", { ...altGraph, code: "KeyC", shiftKey: true });
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.deepEqual(keyboardRecords(), [
+      [47, 1, 0x40], [47, 2, 0x40], [47, 0, 0], [46, 1, 0x01000106], [46, 0, 0],
+    ]);
+  });
+
+  await t.test("Ctrl, Meta and ordinary Alt shortcuts remain physical", () => {
+    for (const modifier of ["ctrlKey", "metaKey", "altKey"]) {
+      controlSocket.sent.length = 0;
+      keyEvent("keydown", "'", { [modifier]: true });
+      keyEvent("keydown", "'", { [modifier]: true, repeat: true });
+      keyEvent("keyup", "'", { [modifier]: true });
+      assert.deepEqual(keyboardRecords(), [[16, 1, 0], [16, 2, 0], [16, 0, 0]]);
+    }
+  });
+
+  await t.test("missing capability keeps repeats physical too", () => {
+    controlSocket.dispatch("message", {
+      data: JSON.stringify({ type: "control-state", state: "active" }),
+    });
+    controlSocket.sent.length = 0;
+    keyEvent("keydown", "@", { code: "Digit2", shiftKey: true });
+    keyEvent("keydown", "2", { code: "Digit2", repeat: true });
+    keyEvent("keyup", "2", { code: "Digit2" });
+    assert.deepEqual(keyboardRecords(), [[3, 1, 0], [3, 2, 0], [3, 0, 0]]);
+  });
 });
 
 test("session disposal is terminal, idempotent, and disposes its surface", async () => {

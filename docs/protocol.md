@@ -23,9 +23,12 @@ Key records use the Linux evdev keycode in `a`. On a press, `b` may contain the
 browser-resolved XKB keysym for one printable character. Latin-1 characters use
 their standard keysym value; other Unicode scalar values use `0x01000000 | codepoint`.
 A zero `b` keeps physical-key behavior. Repeat and release records retain the
-route selected by the initial press, using `a` as the held-key identity. The
-gateway advertises resolved keysym support in control-state messages; clients
-must send zero when that capability is absent.
+route selected by the initial press, using `a` as the held-key identity. For a
+resolved key, a nonzero `b` on repeat updates the character (for example after
+releasing Shift); zero retains the previous symbol for compatibility with older
+clients. Release records do not change the symbol. The gateway advertises resolved
+keysym support in control-state messages; clients must send zero when that
+capability is absent.
 
 ## Stream daemon events
 

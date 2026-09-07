@@ -244,7 +244,7 @@ fn installKeymap(self: *RemoteInput) !void {
         xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
     ) orelse return error.XkbKeymapFailed;
     defer xkb.xkb_keymap_unref(base_keymap);
-    const source = try keymapSource(self.allocator, base_keymap, self.layout, &self.resolved_keysyms);
+    const source = try keymapSource(self.allocator, base_keymap, &self.resolved_keysyms);
     defer self.allocator.free(source);
     const keymap = xkb.xkb_keymap_new_from_string(
         self.xkb_context.?,
@@ -280,6 +280,10 @@ fn installKeymap(self: *RemoteInput) !void {
     if (self.xkb_keymap) |old_keymap| xkb.xkb_keymap_unref(old_keymap);
     self.xkb_keymap = keymap;
     self.xkb_state = state;
+    // Clients create a fresh XKB state on keymap replacement. Force a
+    // modifier transition so compositors that suppress unchanged masks
+    // still restore held Ctrl/Alt/etc. before the next physical shortcut.
+    self.sendNeutralModifiers();
     self.sendModifiers();
 }
 
@@ -307,21 +311,25 @@ fn restoreXKBState(
 fn keymapSource(
     allocator: std.mem.Allocator,
     base_keymap: *xkb.struct_xkb_keymap,
-    layout: []const u8,
     resolved_keysyms: *const [256]u32,
 ) ![:0]u8 {
+    const text_pointer = xkb.xkb_keymap_get_as_string(
+        base_keymap,
+        xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
+    ) orelse return error.SerializeKeymapFailed;
+    defer xkb.free(text_pointer);
+    const text = std.mem.span(text_pointer);
+    // Amend xkbcommon's serialized symbols section, preserving all rules,
+    // model and option resolution in the base map. Its section terminators
+    // are unindented; individual key definitions are indented.
+    const symbols = std.mem.indexOf(u8, text, "\nxkb_symbols ") orelse
+        return error.InvalidKeymapSource;
+    const end = std.mem.indexOfPos(u8, text, symbols, "\n};") orelse
+        return error.InvalidKeymapSource;
     var source: std.ArrayList(u8) = .empty;
     errdefer source.deinit(allocator);
-    try source.appendSlice(allocator,
-        \\xkb_keymap {
-        \\xkb_keycodes { include "evdev+aliases(qwerty)" };
-        \\xkb_types { include "complete" };
-        \\xkb_compatibility { include "complete" };
-        \\xkb_symbols {
-        \\include "pc+
-    );
-    try source.appendSlice(allocator, layout);
-    try source.appendSlice(allocator, "+inet(evdev)\"\n");
+    try source.appendSlice(allocator, text[0..end]);
+    try source.append(allocator, '\n');
     for (resolved_keysyms, 0..) |keysym, key| {
         if (keysym == 0) continue;
         const name_pointer = xkb.xkb_keymap_key_get_name(base_keymap, @intCast(key + 8)) orelse
@@ -332,7 +340,7 @@ fn keymapSource(
             .{ std.mem.span(name_pointer), keysym },
         );
     }
-    try source.appendSlice(allocator, "};\n};\n");
+    try source.appendSlice(allocator, text[end..]);
     return source.toOwnedSliceSentinel(allocator, 0);
 }
 
@@ -392,19 +400,16 @@ fn applyButton(self: *RemoteInput, time: u32, button: u32, pressed: bool) void {
 fn applyKey(self: *RemoteInput, time: u32, key: u32, keysym: u32, state: KeyState) void {
     if (key == 0 or key >= self.pressed_keys.len) return;
     const keyboard = self.keyboard orelse return;
+    const pressed = state == .pressed;
     if (state == .repeated) {
         if (!self.pressed_keys[key]) return;
-        // Preserve browser-owned cadence for clients predating wl_keyboard's
-        // repeated pseudo-state without changing our tracked held-key state.
-        if (self.held_keysyms[key] != 0) self.sendNeutralModifiers();
-        keyboard.key(time, key, @intFromEnum(KeyState.released));
-        keyboard.key(time, key, @intFromEnum(KeyState.pressed));
-        if (self.held_keysyms[key] != 0) self.sendModifiers();
+    } else if (self.pressed_keys[key] == pressed) {
         return;
     }
-    const pressed = state == .pressed;
-    if (self.pressed_keys[key] == pressed) return;
-    if (pressed) {
+    // Keep the initial physical/resolved route, but allow a resolved repeat
+    // to change character (e.g. releasing Shift while holding a digit).
+    // Older clients send zero on repeats; retain their last resolved symbol.
+    if (pressed or (state == .repeated and self.held_keysyms[key] != 0 and keysym != 0)) {
         if (self.resolved_keysyms[key] != keysym) {
             const old_keysym = self.resolved_keysyms[key];
             self.resolved_keysyms[key] = keysym;
@@ -414,6 +419,15 @@ fn applyKey(self: *RemoteInput, time: u32, key: u32, keysym: u32, state: KeyStat
             };
         }
         self.held_keysyms[key] = keysym;
+    }
+    if (state == .repeated) {
+        // Preserve browser-owned cadence for clients predating wl_keyboard's
+        // repeated pseudo-state without changing our tracked held-key state.
+        if (self.held_keysyms[key] != 0) self.sendNeutralModifiers();
+        keyboard.key(time, key, @intFromEnum(KeyState.released));
+        keyboard.key(time, key, @intFromEnum(KeyState.pressed));
+        if (self.held_keysyms[key] != 0) self.sendModifiers();
+        return;
     }
     if (self.held_keysyms[key] != 0) self.sendNeutralModifiers();
     self.pressed_keys[key] = pressed;
@@ -577,7 +591,6 @@ test "resolved keysym overlays compile and replace the physical symbol" {
     const source = try keymapSource(
         std.testing.allocator,
         base_keymap,
-        "us",
         &resolved_keysyms,
     );
     defer std.testing.allocator.free(source);
@@ -593,6 +606,48 @@ test "resolved keysym overlays compile and replace the physical symbol" {
 
     try std.testing.expectEqual(@as(u32, 0x27), xkb.xkb_state_key_get_one_sym(state, 16 + 8));
     try std.testing.expectEqual(@as(u32, 0xfc), xkb.xkb_state_key_get_one_sym(state, 30 + 8));
+}
+
+test "resolved keymap transitions preserve configured base options" {
+    const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
+        return error.XkbContextFailed;
+    defer xkb.xkb_context_unref(context);
+    const base_keymap = xkb.xkb_keymap_new_from_names(
+        context,
+        &xkb.struct_xkb_rule_names{
+            .rules = null,
+            .model = null,
+            .layout = "us",
+            .variant = null,
+            .options = "ctrl:nocaps",
+        },
+        xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return error.XkbKeymapFailed;
+    defer xkb.xkb_keymap_unref(base_keymap);
+    var resolved_keysyms: [256]u32 = @splat(0);
+    // Start physical, resolve Shift+2, release Shift, change layout, then
+    // return to physical input. Caps-as-Ctrl must survive every replacement.
+    for ([_]u32{ 0, 0x40, 0x32, 0x01000106, 0 }) |keysym| {
+        resolved_keysyms[3] = keysym;
+        const source = try keymapSource(std.testing.allocator, base_keymap, &resolved_keysyms);
+        defer std.testing.allocator.free(source);
+        const keymap = xkb.xkb_keymap_new_from_string(
+            context,
+            source.ptr,
+            xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
+            xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+        ) orelse return error.XkbKeymapFailed;
+        defer xkb.xkb_keymap_unref(keymap);
+        const state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+        defer xkb.xkb_state_unref(state);
+        try std.testing.expectEqual(@as(u32, xkb.XKB_KEY_Control_L), xkb.xkb_state_key_get_one_sym(state, 58 + 8));
+        try std.testing.expectEqual(if (keysym == 0) @as(u32, 0x32) else keysym, xkb.xkb_state_key_get_one_sym(state, 3 + 8));
+        try std.testing.expectEqual(@as(c_int, if (keysym == 0) 1 else 0), xkb.xkb_keymap_key_repeats(keymap, 3 + 8));
+        _ = xkb.xkb_state_update_key(state, 58 + 8, xkb.XKB_KEY_DOWN);
+        try std.testing.expect(xkb.xkb_state_mod_name_is_active(state, xkb.XKB_MOD_NAME_CTRL, xkb.XKB_STATE_MODS_DEPRESSED) > 0);
+        _ = xkb.xkb_state_update_key(state, 58 + 8, xkb.XKB_KEY_UP);
+        try std.testing.expectEqual(@as(u32, 0), xkb.xkb_state_serialize_mods(state, xkb.XKB_STATE_MODS_DEPRESSED));
+    }
 }
 
 test "resolved keysyms accept printable Unicode scalar values" {
