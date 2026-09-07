@@ -455,6 +455,8 @@ func TestValidControlRecord(t *testing.T) {
 	repeatedKey[2] = 2
 	repeatedPointer := makeControlRecord(controlPointerButton, true, 0x110, 0, 0)
 	repeatedPointer[2] = 2
+	wrongVersion := makeControlRecord(controlReleaseAll, false, 0, 0, 0)
+	wrongVersion[0] = 1
 	tests := []struct {
 		name   string
 		record []byte
@@ -464,19 +466,23 @@ func TestValidControlRecord(t *testing.T) {
 		{"pointer button", makeControlRecord(controlPointerButton, true, 0x111, 0, 0), true},
 		{"pointer scroll", makeControlRecord(controlPointerScroll, false, math.Float32bits(-14.5), math.Float32bits(120), 0), true},
 		{"keyboard key", makeControlRecord(controlKeyboardKey, true, 30, 0, 0), true},
+		{"latin-1 resolved keyboard key", makeControlRecord(controlKeyboardKey, true, 30, 0xfc, 0), true},
+		{"unicode resolved keyboard key", makeControlRecord(controlKeyboardKey, true, 30, 0x010020ac, 0), true},
 		{"repeated keyboard key", repeatedKey, true},
 		{"release all", releaseAllRecord(), true},
 		{"wrong size", []byte{1, controlReleaseAll}, false},
-		{"wrong version", makeControlRecord(controlReleaseAll, false, 0, 0, 0), false},
+		{"wrong version", wrongVersion, false},
 		{"pointer out of range", makeControlRecord(controlPointerMotion, false, 65_536, 0, 0), false},
 		{"unknown button", makeControlRecord(controlPointerButton, true, 0x115, 0, 0), false},
 		{"repeated pointer button", repeatedPointer, false},
 		{"nan scroll", makeControlRecord(controlPointerScroll, false, math.Float32bits(float32(math.NaN())), 0, 0), false},
 		{"zero key", makeControlRecord(controlKeyboardKey, true, 0, 0, 0), false},
+		{"control keysym", makeControlRecord(controlKeyboardKey, true, 30, 0x1f, 0), false},
+		{"invalid unicode keysym", makeControlRecord(controlKeyboardKey, true, 30, 0x0100d800, 0), false},
+		{"oversized unicode keysym", makeControlRecord(controlKeyboardKey, true, 30, 0x01110000, 0), false},
 		{"release with flag", makeControlRecord(controlReleaseAll, true, 0, 0, 0), false},
 		{"private keyframe acknowledgement", encodeKeyframeReadiness(7, true), false},
 	}
-	tests[7].record[0] = 1
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			if got := validControlRecord(test.record); got != test.valid {
@@ -604,13 +610,14 @@ func expectControlState(t *testing.T, ctx context.Context, connection *websocket
 		t.Fatalf("message type = %v, want text", messageType)
 	}
 	var state struct {
-		Type  string `json:"type"`
-		State string `json:"state"`
+		Type            string `json:"type"`
+		State           string `json:"state"`
+		ResolvedKeysyms bool   `json:"resolvedKeysyms"`
 	}
 	if err := json.Unmarshal(message, &state); err != nil {
 		t.Fatal(err)
 	}
-	if state.Type != "control-state" || state.State != expected {
+	if state.Type != "control-state" || state.State != expected || !state.ResolvedKeysyms {
 		t.Fatalf("control state = %+v, want %q", state, expected)
 	}
 }

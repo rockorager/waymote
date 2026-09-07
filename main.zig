@@ -142,7 +142,7 @@ pub fn main(init: std.process.Init) !void {
             .ffmpeg_path = options.ffmpeg_path,
             .rtp_port = options.rtp_port,
         }),
-        .remote_input = .init(init.io, options.xkb_layout),
+        .remote_input = .init(init.gpa, init.io, options.xkb_layout),
         .clipboard = .init(init.gpa, init.io),
     };
     defer stream.deinit();
@@ -1177,7 +1177,7 @@ test "relative pointer input controls cursor compositing" {
         .pointer_motion = .{ .x = 100, .y = 200, .sequence = 2 },
     };
     const key: RemoteInput.Command = .{
-        .keyboard_key = .{ .key = 30, .state = .pressed },
+        .keyboard_key = .{ .key = 30, .keysym = 0, .state = .pressed },
     };
 
     try std.testing.expect(cursorOverlayForCommand(false, relative));

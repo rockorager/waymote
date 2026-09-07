@@ -822,9 +822,14 @@ func encodeTextInput(action, text string, sequence uint32) ([]byte, error) {
 }
 
 func controlStateMessage(state string) []byte {
-	message, _ := json.Marshal(map[string]string{
-		"type":  "control-state",
-		"state": state,
+	message, _ := json.Marshal(struct {
+		Type            string `json:"type"`
+		State           string `json:"state"`
+		ResolvedKeysyms bool   `json:"resolvedKeysyms"`
+	}{
+		Type:            "control-state",
+		State:           state,
+		ResolvedKeysyms: true,
 	})
 	return message
 }
@@ -920,7 +925,7 @@ func validControlRecord(record []byte) bool {
 		dy := math.Float32frombits(b)
 		return state == 0 && !floatOutOfRange(dx) && !floatOutOfRange(dy) && c != 0
 	case controlKeyboardKey:
-		return a > 0 && a < 256 && b == 0 && c != 0
+		return a > 0 && a < 256 && validResolvedKeysym(b) && c != 0
 	case controlReleaseAll:
 		return state == 0 && a == 0 && b == 0 && c == 0
 	case controlResize:
@@ -933,6 +938,18 @@ func validControlRecord(record []byte) bool {
 	default:
 		return false
 	}
+}
+
+func validResolvedKeysym(keysym uint32) bool {
+	if keysym == 0 || (keysym >= 0x20 && keysym <= 0x7e) ||
+		(keysym >= 0xa0 && keysym <= 0xff) {
+		return true
+	}
+	if keysym < 0x01000100 || keysym > 0x0110ffff {
+		return false
+	}
+	codePoint := keysym & 0x00ffffff
+	return codePoint < 0xd800 || codePoint > 0xdfff
 }
 
 func floatOutOfRange(value float32) bool {

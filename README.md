@@ -13,7 +13,7 @@ particular UI framework.
 
 - H.264 video and Opus audio delivered to browser WebCodecs
 - Absolute and pointer-lock relative mouse input
-- Keyboard, browser composition, and Wayland input-method forwarding
+- Browser-layout-aware keyboard, composition, and Wayland input-method forwarding
 - Bidirectional text clipboard synchronization
 - Fixed, manual, or viewport-driven remote output sizing
 - Capture-to-presentation timing, latency targets, and stream statistics

@@ -46,6 +46,18 @@ function normalizeResizeDimensions(width, height) {
   });
 }
 
+function resolvedKeysym(event) {
+  const altGraph = event.getModifierState?.("AltGraph") === true;
+  if (event.metaKey || (event.ctrlKey && !altGraph) || (event.altKey && !altGraph)) return 0;
+  const characters = Array.from(event.key ?? "");
+  if (characters.length !== 1) return 0;
+  const codePoint = characters[0].codePointAt(0);
+  if (codePoint < 0x20 || (codePoint >= 0x7f && codePoint < 0xa0)) return 0;
+  if (codePoint <= 0xff) return codePoint;
+  if (codePoint >= 0xd800 && codePoint <= 0xdfff) return 0;
+  return 0x01000000 | codePoint;
+}
+
 function createRuntime(owner, options) {
 let display = null;
 let inputElement = null;
@@ -196,6 +208,7 @@ let clipboardPastePending = false;
 let pendingClipboardCopy = null;
 let shortcutClipboardCopy = null;
 let inputSequence = 0;
+let supportsResolvedKeysyms = false;
 let currentGeneration = 0;
 let latestAppliedInput = 0;
 let droppedFrames = 0;
@@ -691,8 +704,14 @@ function scrollRecord(dx, dy) {
   return record;
 }
 
-function keyboardRecord(key, state) {
-  const record = controlRecord(controlKeyboardKey, state === keyPressed, key, 0, nextInputSequence());
+function keyboardRecord(key, state, keysym = 0) {
+  const record = controlRecord(
+    controlKeyboardKey,
+    state === keyPressed,
+    key,
+    keysym,
+    nextInputSequence(),
+  );
   new DataView(record).setUint8(2, state);
   return record;
 }
@@ -871,6 +890,7 @@ async function connectControl() {
     return;
   }
   if (controlConnectAttempt) return;
+  supportsResolvedKeysyms = false;
   setControlStatus("Input connecting");
   const attempt = { generation: connectionGeneration };
   controlConnectAttempt = attempt;
@@ -931,6 +951,9 @@ async function connectControl() {
     } catch {
       socket.close(1003, "invalid control state");
       return;
+    }
+    if (message.type === "control-state") {
+      supportsResolvedKeysyms = message.resolvedKeysyms === true;
     }
     if (message.type !== "control-state") {
       if (message.type === "pong" && pings.has(message.id)) {
@@ -1007,6 +1030,7 @@ async function connectControl() {
     }
     controlSocket = null;
     controlActive = false;
+    supportsResolvedKeysyms = false;
     lastResizeRequest = null;
     pendingControlRecords = [];
     pressedKeys.clear();
@@ -1165,7 +1189,11 @@ function handleKeyDown(event) {
   }
   if (!pressedKeys.has(key)) {
     pressedKeys.add(key);
-    sendControl(keyboardRecord(key, keyPressed));
+    sendControl(keyboardRecord(
+      key,
+      keyPressed,
+      supportsResolvedKeysyms ? resolvedKeysym(event) : 0,
+    ));
   } else if (event.repeat) {
     sendControl(keyboardRecord(key, keyRepeated));
   }
@@ -2286,4 +2314,8 @@ export class WaymoteSession {
   }
 }
 
-export const __testing = Object.freeze({ fitObservedResize, normalizeResizeDimensions });
+export const __testing = Object.freeze({
+  fitObservedResize,
+  normalizeResizeDimensions,
+  resolvedKeysym,
+});
