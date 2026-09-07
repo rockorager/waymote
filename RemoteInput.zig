@@ -37,11 +37,12 @@ pub const Command = union(CommandType) {
     pointer_motion: struct { x: u32, y: u32, sequence: u32 },
     pointer_button: struct { button: u32, pressed: bool },
     pointer_scroll: struct { dx: f32, dy: f32 },
-    keyboard_key: struct { key: u32, state: KeyState },
+    keyboard_key: struct { key: u32, keysym: u32, state: KeyState },
     release_all,
     pointer_relative: struct { dx: f32, dy: f32, sequence: u32 },
 };
 
+allocator: std.mem.Allocator,
 io: std.Io,
 seat: ?*wl.Seat = null,
 keyboard_manager: ?*zwp.VirtualKeyboardManagerV1 = null,
@@ -58,12 +59,14 @@ xkb_context: ?*xkb.struct_xkb_context = null,
 xkb_keymap: ?*xkb.struct_xkb_keymap = null,
 xkb_state: ?*xkb.struct_xkb_state = null,
 pressed_keys: [256]bool = @splat(false),
+held_keysyms: [256]u32 = @splat(0),
+resolved_keysyms: [256]u32 = @splat(0),
 pressed_buttons: [5]bool = @splat(false),
 
 layout: [:0]const u8 = "us",
 
-pub fn init(io: std.Io, layout: [:0]const u8) RemoteInput {
-    return .{ .io = io, .layout = layout };
+pub fn init(allocator: std.mem.Allocator, io: std.Io, layout: [:0]const u8) RemoteInput {
+    return .{ .allocator = allocator, .io = io, .layout = layout };
 }
 
 pub fn bindGlobal(
@@ -169,7 +172,7 @@ pub fn apply(self: *RemoteInput, command: Command) void {
             }
             pointer.frame();
         },
-        .keyboard_key => |key| self.applyKey(time, key.key, key.state),
+        .keyboard_key => |key| self.applyKey(time, key.key, key.keysym, key.state),
         .release_all => self.releaseAll(),
     }
 }
@@ -213,8 +216,8 @@ pub fn decodeRecord(record: *const [record_size]u8) !Command {
             }
             break :blk .{ .pointer_scroll = .{ .dx = dx, .dy = dy } };
         },
-        .keyboard_key => if (a > 0 and a < 256 and b == 0 and c != 0)
-            .{ .keyboard_key = .{ .key = a, .state = key_state } }
+        .keyboard_key => if (a > 0 and a < 256 and validResolvedKeysym(b) and c != 0)
+            .{ .keyboard_key = .{ .key = a, .keysym = b, .state = key_state } }
         else
             error.InvalidInputRecord,
         .release_all => if (a == 0 and b == 0 and c == 0 and key_state == .released)
@@ -225,11 +228,12 @@ pub fn decodeRecord(record: *const [record_size]u8) !Command {
 }
 
 fn installKeymap(self: *RemoteInput) !void {
-    const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
-        return error.XkbContextFailed;
-    self.xkb_context = context;
-    const keymap = xkb.xkb_keymap_new_from_names(
-        context,
+    if (self.xkb_context == null) {
+        self.xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
+            return error.XkbContextFailed;
+    }
+    const base_keymap = xkb.xkb_keymap_new_from_names(
+        self.xkb_context.?,
         &xkb.struct_xkb_rule_names{
             .rules = null,
             .model = null,
@@ -239,8 +243,21 @@ fn installKeymap(self: *RemoteInput) !void {
         },
         xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
     ) orelse return error.XkbKeymapFailed;
-    self.xkb_keymap = keymap;
-    self.xkb_state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+    defer xkb.xkb_keymap_unref(base_keymap);
+    const source = try keymapSource(self.allocator, base_keymap, self.layout, &self.resolved_keysyms);
+    defer self.allocator.free(source);
+    const keymap = xkb.xkb_keymap_new_from_string(
+        self.xkb_context.?,
+        source.ptr,
+        xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
+        xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return error.XkbKeymapFailed;
+    errdefer xkb.xkb_keymap_unref(keymap);
+    const state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+    errdefer xkb.xkb_state_unref(state);
+    if (self.xkb_state) |old_state| {
+        restoreXKBState(state, old_state, &self.pressed_keys);
+    }
     const text_pointer = xkb.xkb_keymap_get_as_string(
         keymap,
         xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
@@ -255,8 +272,68 @@ fn installKeymap(self: *RemoteInput) !void {
     errdefer file.close(self.io);
     try file.setLength(self.io, size);
     try file.writeStreamingAll(self.io, text_pointer[0..size]);
+    const old_file = self.keymap_file;
     self.keymap_file = file;
     self.keyboard.?.keymap(.xkb_v1, fd, @intCast(size));
+    if (old_file) |old| old.close(self.io);
+    if (self.xkb_state) |old_state| xkb.xkb_state_unref(old_state);
+    if (self.xkb_keymap) |old_keymap| xkb.xkb_keymap_unref(old_keymap);
+    self.xkb_keymap = keymap;
+    self.xkb_state = state;
+    self.sendModifiers();
+}
+
+fn restoreXKBState(
+    state: *xkb.struct_xkb_state,
+    old_state: *xkb.struct_xkb_state,
+    pressed_keys: *const [256]bool,
+) void {
+    for (pressed_keys, 0..) |pressed, key| {
+        if (pressed) {
+            _ = xkb.xkb_state_update_key(state, @intCast(key + 8), xkb.XKB_KEY_DOWN);
+        }
+    }
+    _ = xkb.xkb_state_update_mask(
+        state,
+        xkb.xkb_state_serialize_mods(state, xkb.XKB_STATE_MODS_DEPRESSED),
+        xkb.xkb_state_serialize_mods(old_state, xkb.XKB_STATE_MODS_LATCHED),
+        xkb.xkb_state_serialize_mods(old_state, xkb.XKB_STATE_MODS_LOCKED),
+        0,
+        0,
+        xkb.xkb_state_serialize_layout(old_state, xkb.XKB_STATE_LAYOUT_LOCKED),
+    );
+}
+
+fn keymapSource(
+    allocator: std.mem.Allocator,
+    base_keymap: *xkb.struct_xkb_keymap,
+    layout: []const u8,
+    resolved_keysyms: *const [256]u32,
+) ![:0]u8 {
+    var source: std.ArrayList(u8) = .empty;
+    errdefer source.deinit(allocator);
+    try source.appendSlice(allocator,
+        \\xkb_keymap {
+        \\xkb_keycodes { include "evdev+aliases(qwerty)" };
+        \\xkb_types { include "complete" };
+        \\xkb_compatibility { include "complete" };
+        \\xkb_symbols {
+        \\include "pc+
+    );
+    try source.appendSlice(allocator, layout);
+    try source.appendSlice(allocator, "+inet(evdev)\"\n");
+    for (resolved_keysyms, 0..) |keysym, key| {
+        if (keysym == 0) continue;
+        const name_pointer = xkb.xkb_keymap_key_get_name(base_keymap, @intCast(key + 8)) orelse
+            return error.XkbKeyNameMissing;
+        try source.print(
+            allocator,
+            "override key <{s}> {{ repeat=no, type=\"ONE_LEVEL\", symbols[Group1]= [ 0x{x:0>8} ] }};\n",
+            .{ std.mem.span(name_pointer), keysym },
+        );
+    }
+    try source.appendSlice(allocator, "};\n};\n");
+    return source.toOwnedSliceSentinel(allocator, 0);
 }
 
 pub fn sendText(self: *RemoteInput, preedit: bool, text: []const u8) void {
@@ -312,19 +389,33 @@ fn applyButton(self: *RemoteInput, time: u32, button: u32, pressed: bool) void {
     pointer.frame();
 }
 
-fn applyKey(self: *RemoteInput, time: u32, key: u32, state: KeyState) void {
+fn applyKey(self: *RemoteInput, time: u32, key: u32, keysym: u32, state: KeyState) void {
     if (key == 0 or key >= self.pressed_keys.len) return;
     const keyboard = self.keyboard orelse return;
     if (state == .repeated) {
         if (!self.pressed_keys[key]) return;
         // Preserve browser-owned cadence for clients predating wl_keyboard's
         // repeated pseudo-state without changing our tracked held-key state.
+        if (self.held_keysyms[key] != 0) self.sendNeutralModifiers();
         keyboard.key(time, key, @intFromEnum(KeyState.released));
         keyboard.key(time, key, @intFromEnum(KeyState.pressed));
+        if (self.held_keysyms[key] != 0) self.sendModifiers();
         return;
     }
     const pressed = state == .pressed;
     if (self.pressed_keys[key] == pressed) return;
+    if (pressed) {
+        if (self.resolved_keysyms[key] != keysym) {
+            const old_keysym = self.resolved_keysyms[key];
+            self.resolved_keysyms[key] = keysym;
+            self.installKeymap() catch {
+                self.resolved_keysyms[key] = old_keysym;
+                return;
+            };
+        }
+        self.held_keysyms[key] = keysym;
+    }
+    if (self.held_keysyms[key] != 0) self.sendNeutralModifiers();
     self.pressed_keys[key] = pressed;
     keyboard.key(time, key, @intFromEnum(state));
     _ = xkb.xkb_state_update_key(
@@ -333,6 +424,11 @@ fn applyKey(self: *RemoteInput, time: u32, key: u32, state: KeyState) void {
         if (pressed) xkb.XKB_KEY_DOWN else xkb.XKB_KEY_UP,
     );
     self.sendModifiers();
+    if (!pressed) self.held_keysyms[key] = 0;
+}
+
+fn sendNeutralModifiers(self: *RemoteInput) void {
+    self.keyboard.?.modifiers(0, 0, 0, 0);
 }
 
 fn sendModifiers(self: *RemoteInput) void {
@@ -360,6 +456,7 @@ pub fn releaseAll(self: *RemoteInput) void {
     for (&self.pressed_keys, 0..) |*pressed, key| {
         if (!pressed.*) continue;
         pressed.* = false;
+        self.held_keysyms[key] = 0;
         released_key = true;
         if (self.keyboard) |keyboard| {
             keyboard.key(time, @intCast(key), @intFromEnum(wl.Keyboard.KeyState.released));
@@ -369,6 +466,20 @@ pub fn releaseAll(self: *RemoteInput) void {
         }
     }
     if (released_key) self.sendModifiers();
+    if (std.mem.allEqual(u32, &self.resolved_keysyms, 0)) return;
+    const old_keysyms = self.resolved_keysyms;
+    self.resolved_keysyms = @splat(0);
+    self.installKeymap() catch {
+        self.resolved_keysyms = old_keysyms;
+    };
+}
+
+fn validResolvedKeysym(keysym: u32) bool {
+    if (keysym == 0 or (keysym >= 0x20 and keysym <= 0x7e) or
+        (keysym >= 0xa0 and keysym <= 0xff)) return true;
+    if (keysym < 0x01000100 or keysym > 0x0110ffff) return false;
+    const code_point = keysym & 0x00ffffff;
+    return code_point < 0xd800 or code_point > 0xdfff;
 }
 
 fn buttonIndex(button: u32) ?usize {
@@ -418,23 +529,117 @@ test "remote input records decode bounded commands" {
     std.mem.writeInt(u32, record[4..8], 30, .little);
     std.mem.writeInt(u32, record[8..12], 0, .little);
     try std.testing.expectEqual(
-        Command{ .keyboard_key = .{ .key = 30, .state = .pressed } },
+        Command{ .keyboard_key = .{ .key = 30, .keysym = 0, .state = .pressed } },
         try decodeRecord(&record),
     );
 
     record[2] = 2;
     try std.testing.expectEqual(
-        Command{ .keyboard_key = .{ .key = 30, .state = .repeated } },
+        Command{ .keyboard_key = .{ .key = 30, .keysym = 0, .state = .repeated } },
+        try decodeRecord(&record),
+    );
+
+    std.mem.writeInt(u32, record[8..12], 0x010020ac, .little);
+    try std.testing.expectEqual(
+        Command{ .keyboard_key = .{ .key = 30, .keysym = 0x010020ac, .state = .repeated } },
         try decodeRecord(&record),
     );
 
     record[1] = @intFromEnum(CommandType.pointer_button);
     record[2] = 1;
     std.mem.writeInt(u32, record[4..8], 0x111, .little);
+    std.mem.writeInt(u32, record[8..12], 0, .little);
     try std.testing.expectEqual(
         Command{ .pointer_button = .{ .button = 0x111, .pressed = true } },
         try decodeRecord(&record),
     );
+}
+
+test "resolved keysym overlays compile and replace the physical symbol" {
+    const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
+        return error.XkbContextFailed;
+    defer xkb.xkb_context_unref(context);
+    const base_keymap = xkb.xkb_keymap_new_from_names(
+        context,
+        &xkb.struct_xkb_rule_names{
+            .rules = null,
+            .model = null,
+            .layout = "us",
+            .variant = null,
+            .options = null,
+        },
+        xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return error.XkbKeymapFailed;
+    defer xkb.xkb_keymap_unref(base_keymap);
+    var resolved_keysyms: [256]u32 = @splat(0);
+    resolved_keysyms[16] = 0x27;
+    resolved_keysyms[30] = 0xfc;
+    const source = try keymapSource(
+        std.testing.allocator,
+        base_keymap,
+        "us",
+        &resolved_keysyms,
+    );
+    defer std.testing.allocator.free(source);
+    const keymap = xkb.xkb_keymap_new_from_string(
+        context,
+        source.ptr,
+        xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
+        xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return error.XkbKeymapFailed;
+    defer xkb.xkb_keymap_unref(keymap);
+    const state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+    defer xkb.xkb_state_unref(state);
+
+    try std.testing.expectEqual(@as(u32, 0x27), xkb.xkb_state_key_get_one_sym(state, 16 + 8));
+    try std.testing.expectEqual(@as(u32, 0xfc), xkb.xkb_state_key_get_one_sym(state, 30 + 8));
+}
+
+test "resolved keysyms accept printable Unicode scalar values" {
+    try std.testing.expect(validResolvedKeysym(0));
+    try std.testing.expect(validResolvedKeysym(0x20));
+    try std.testing.expect(validResolvedKeysym(0xfc));
+    try std.testing.expect(validResolvedKeysym(0x0101f986));
+    try std.testing.expect(!validResolvedKeysym(0x1f));
+    try std.testing.expect(!validResolvedKeysym(0x0100d800));
+    try std.testing.expect(!validResolvedKeysym(0x01110000));
+}
+
+test "keymap replacement retains and releases held modifiers" {
+    const context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
+        return error.XkbContextFailed;
+    defer xkb.xkb_context_unref(context);
+    const keymap = xkb.xkb_keymap_new_from_names(
+        context,
+        &xkb.struct_xkb_rule_names{
+            .rules = null,
+            .model = null,
+            .layout = "us",
+            .variant = null,
+            .options = null,
+        },
+        xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+    ) orelse return error.XkbKeymapFailed;
+    defer xkb.xkb_keymap_unref(keymap);
+    const old_state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+    defer xkb.xkb_state_unref(old_state);
+    const replacement_state = xkb.xkb_state_new(keymap) orelse return error.XkbStateFailed;
+    defer xkb.xkb_state_unref(replacement_state);
+    const shift_key = 42;
+    _ = xkb.xkb_state_update_key(old_state, shift_key + 8, xkb.XKB_KEY_DOWN);
+    var pressed_keys: [256]bool = @splat(false);
+    pressed_keys[shift_key] = true;
+
+    restoreXKBState(replacement_state, old_state, &pressed_keys);
+    try std.testing.expect(xkb.xkb_state_serialize_mods(
+        replacement_state,
+        xkb.XKB_STATE_MODS_DEPRESSED,
+    ) != 0);
+    _ = xkb.xkb_state_update_key(replacement_state, shift_key + 8, xkb.XKB_KEY_UP);
+    try std.testing.expectEqual(@as(u32, 0), xkb.xkb_state_serialize_mods(
+        replacement_state,
+        xkb.XKB_STATE_MODS_DEPRESSED,
+    ));
 }
 
 test "v2 relative input preserves sequence and layout names are conservative" {

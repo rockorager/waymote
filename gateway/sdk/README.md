@@ -67,6 +67,11 @@ viewport-driven sizing with `session.remoteDisplay.observe({ element })`.
 Changing the canvas's CSS or backing dimensions never implicitly resizes the
 remote compositor.
 
+Printable keyboard input follows the layout resolved by the browser, so users
+do not need to select their local keyboard layout in the application. Ctrl,
+Meta, and ordinary Alt shortcuts remain physical-key shortcuts. The gateway's
+`-xkb-layout` setting remains the fallback for older browser clients.
+
 Audio must be enabled from a user gesture with `session.audio.enable()`. The
 package includes its AudioWorklet beside the SDK module; `audioWorkletURL` can
 override that URL when an application's bundler or content policy requires a

@@ -58,6 +58,115 @@ test("fixed resize dimensions cannot exceed the protocol envelope", () => {
   );
 });
 
+test("printable keys resolve to XKB keysyms from the browser layout", () => {
+  const event = (key, modifiers = {}) => ({
+    key,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    getModifierState: () => false,
+    ...modifiers,
+  });
+
+  assert.equal(__testing.resolvedKeysym(event("q")), 0x71);
+  assert.equal(__testing.resolvedKeysym(event("'")), 0x27);
+  assert.equal(__testing.resolvedKeysym(event("ü")), 0xfc);
+  assert.equal(__testing.resolvedKeysym(event("🦆")), 0x101f986);
+  assert.equal(__testing.resolvedKeysym(event("a", { ctrlKey: true })), 0);
+  assert.equal(__testing.resolvedKeysym(event("a", { metaKey: true })), 0);
+  assert.equal(__testing.resolvedKeysym(event("a", { altKey: true })), 0);
+  assert.equal(__testing.resolvedKeysym(event("€", {
+    altKey: true,
+    ctrlKey: true,
+    getModifierState: (name) => name === "AltGraph",
+  })), 0x10020ac);
+});
+
+test("keyboard records use resolved keysyms only when the gateway advertises support", async (t) => {
+  const fakeWindow = new FakeTarget();
+  fakeWindow.devicePixelRatio = 1;
+  fakeWindow.VideoDecoder = true;
+  const fakeDocument = new FakeTarget();
+  fakeDocument.hidden = false;
+  fakeDocument.pointerLockElement = null;
+  globalThis.window = fakeWindow;
+  globalThis.document = fakeDocument;
+
+  class FakeWebSocket extends FakeTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    readyState = FakeWebSocket.CONNECTING;
+    binaryType = "";
+    sent = [];
+    send(value) { this.sent.push(value); }
+    close() { this.readyState = FakeWebSocket.CLOSED; }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+
+  const sockets = new Map();
+  const canvas = new FakeTarget();
+  canvas.width = 1280;
+  canvas.height = 720;
+  canvas.getContext = () => ({});
+  canvas.focus = () => {};
+  const textInput = new FakeTarget();
+  textInput.value = "";
+  textInput.focus = () => {};
+  const session = new WaymoteSession({
+    endpoint: "https://desktop.example.com",
+    audio: false,
+    createWebSocket(path) {
+      const socket = new FakeWebSocket();
+      sockets.set(path, socket);
+      return socket;
+    },
+  });
+  t.after(() => session.dispose());
+  session.attachSurface({ canvas, textInputElement: textInput });
+  session.connect();
+  await Promise.resolve();
+  await Promise.resolve();
+  session.input.acquire();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const controlSocket = sockets.get("/control");
+  controlSocket.readyState = FakeWebSocket.OPEN;
+  controlSocket.dispatch("open", {});
+  const keyEvent = (type, key) => canvas.dispatch(type, {
+    code: "KeyQ",
+    key,
+    ctrlKey: false,
+    metaKey: false,
+    altKey: false,
+    repeat: false,
+    isComposing: false,
+    keyCode: 81,
+    getModifierState: () => false,
+    preventDefault() {},
+    stopPropagation() {},
+  });
+
+  controlSocket.dispatch("message", {
+    data: JSON.stringify({ type: "control-state", state: "active" }),
+  });
+  keyEvent("keydown", "q");
+  keyEvent("keyup", "q");
+  controlSocket.dispatch("message", {
+    data: JSON.stringify({
+      type: "control-state",
+      state: "active",
+      resolvedKeysyms: true,
+    }),
+  });
+  keyEvent("keydown", "'");
+
+  const records = controlSocket.sent.filter((value) => value instanceof ArrayBuffer);
+  assert.equal(new DataView(records[0]).getUint32(8, true), 0);
+  assert.equal(new DataView(records[2]).getUint32(8, true), 0x27);
+});
+
 test("session disposal is terminal, idempotent, and disposes its surface", async () => {
   const fakeWindow = new FakeTarget();
   fakeWindow.devicePixelRatio = 1;

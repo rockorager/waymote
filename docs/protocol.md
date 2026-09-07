@@ -19,6 +19,14 @@ FPS, and encoded scale percent. Text (type 10) is followed by at most 4000
 UTF-8 bytes without NUL; state 1 is preedit and state 0 is commit, payload
 length is `a`, and input sequence is `b`.
 
+Key records use the Linux evdev keycode in `a`. On a press, `b` may contain the
+browser-resolved XKB keysym for one printable character. Latin-1 characters use
+their standard keysym value; other Unicode scalar values use `0x01000000 | codepoint`.
+A zero `b` keeps physical-key behavior. Repeat and release records retain the
+route selected by the initial press, using `a` as the held-key identity. The
+gateway advertises resolved keysym support in control-state messages; clients
+must send zero when that capability is absent.
+
 ## Stream daemon events
 
 Daemon stdout events have an 8-byte header:
