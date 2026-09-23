@@ -282,16 +282,84 @@ type qualityPolicy struct {
 	bitrate, fps, scale uint32
 	maxBitrate, maxFPS  uint32
 	bad, good           int
-	last                time.Time
+	// Lowest positive RTT the current controller reported recently, or zero
+	// before the first measurement. Congestion is judged relative to it. The
+	// window fields collect the next baseline so a link that becomes slower
+	// for good is adopted within about two windows.
+	baseRTT      float64
+	windowMinRTT float64
+	windowStart  time.Time
+	last         time.Time
 }
 
-func (p *qualityPolicy) update(queue uint32, dropped uint64, renderedFPS float64, rtt float64, active bool, now time.Time) bool {
+// RTT thresholds for a nearby viewer, in milliseconds. A distant viewer whose
+// idle RTT already exceeds the recovery threshold would otherwise only ever
+// downshift, so both thresholds also float above the best RTT the controller
+// has shown.
+const (
+	congestedRTTFloor  = 250.0
+	congestedRTTMargin = 150.0
+	healthyRTTFloor    = 120.0
+	healthyRTTMargin   = 50.0
+	// Lowest frame rate the policy requests; streamd rejects quality records
+	// below it.
+	minimumQualityFPS = 10
+	// How long the lowest observed RTT stays the baseline. Congestion lasts
+	// seconds; a link change lasts longer than this.
+	baselineWindow = time.Minute
+)
+
+// resetBaseline forgets the previous controller's link. Quality itself carries
+// over because the encoder is shared; the new controller recovers it if its
+// link allows.
+func (p *qualityPolicy) resetBaseline() {
+	p.baseRTT = 0
+	p.windowMinRTT = 0
+	p.windowStart = time.Time{}
+	p.bad = 0
+	p.good = 0
+}
+
+func (p *qualityPolicy) observeRTT(rtt float64, now time.Time) {
+	if rtt > 0 {
+		if p.baseRTT == 0 || rtt < p.baseRTT {
+			p.baseRTT = rtt
+		}
+		if p.windowMinRTT == 0 || rtt < p.windowMinRTT {
+			p.windowMinRTT = rtt
+		}
+	}
+	if p.windowStart.IsZero() {
+		p.windowStart = now
+		return
+	}
+	if now.Sub(p.windowStart) >= baselineWindow {
+		if p.windowMinRTT > 0 {
+			p.baseRTT = p.windowMinRTT
+		}
+		p.windowMinRTT = 0
+		p.windowStart = now
+	}
+}
+
+func (p *qualityPolicy) update(queue uint32, dropped uint64, rtt float64, now time.Time) bool {
 	// Presentation scheduling intentionally drops stale frames to preserve
 	// latency. Those drops are not evidence of network congestion; decoder
 	// backlog and sustained RTT are. React conservatively and sacrifice one
 	// quality dimension at a time, preserving sharp text as long as possible.
-	bad := queue >= 5 || rtt > 250
-	good := active && queue <= 1 && dropped == 0 && rtt < 120 && renderedFPS >= float64(p.fps)*0.9
+	//
+	// Capture is damage-driven once the client holds a keyframe, so a static
+	// desktop delivers no chunks and one with a blinking cursor renders a few
+	// frames per second no matter what the link allows. Neither the rendered
+	// frame rate nor idleness is evidence about the link, so they must neither
+	// downshift nor block recovery; otherwise one transient spike leaves text
+	// blurry until the desktop restarts. A client that cannot keep up shows it
+	// through decoder backlog and presentation drops instead.
+	p.observeRTT(rtt, now)
+	congestedRTT := max(congestedRTTFloor, p.baseRTT+congestedRTTMargin)
+	healthyRTT := max(healthyRTTFloor, p.baseRTT+healthyRTTMargin)
+	bad := queue >= 5 || rtt > congestedRTT
+	good := queue <= 1 && dropped == 0 && rtt < healthyRTT
 	if bad {
 		p.bad++
 		p.good = 0
@@ -306,26 +374,34 @@ func (p *qualityPolicy) update(queue uint32, dropped uint64, renderedFPS float64
 		return false
 	}
 	if p.bad >= 2 {
+		// Encoding below full resolution blurs text, so spend every frame-rate
+		// step before touching scale.
+		p.bad = 0
 		minimumBitrate := max(uint32(300), p.maxBitrate/2)
 		if p.bitrate > minimumBitrate {
 			p.bitrate = max(minimumBitrate, p.bitrate*80/100)
-		} else if p.fps > 20 {
-			p.fps -= 10
+		} else if p.fps > minimumQualityFPS {
+			p.fps = max(minimumQualityFPS, p.fps-10)
 		} else if p.scale > 50 {
 			p.scale -= 25
+		} else {
+			return false
 		}
-		p.bad = 0
 		p.last = now
 		return true
 	}
 	if p.good >= 8 {
+		p.good = 0
+		bitrate, fps, scale := p.bitrate, p.fps, p.scale
 		p.bitrate = min(p.maxBitrate, p.bitrate*110/100)
 		if p.scale < 100 {
 			p.scale += 25
 		} else if p.fps < p.maxFPS {
 			p.fps = min(p.maxFPS, p.fps+10)
 		}
-		p.good = 0
+		if p.bitrate == bitrate && p.fps == fps && p.scale == scale {
+			return false
+		}
 		p.last = now
 		return true
 	}
@@ -697,7 +773,7 @@ func (g *gateway) control(w http.ResponseWriter, r *http.Request) {
 					math.IsNaN(envelope.RTT) || math.IsInf(envelope.RTT, 0) || envelope.RTT < 0 || envelope.RTT > 60_000 {
 					continue
 				}
-				if g.quality.update(envelope.Queue, envelope.Dropped, envelope.FPS, envelope.RTT, envelope.Active, time.Now()) {
+				if g.quality.update(envelope.Queue, envelope.Dropped, envelope.RTT, time.Now()) {
 					record := encodeQuality(g.quality)
 					if err := g.input.write(record); err != nil {
 						return
@@ -731,6 +807,7 @@ func (g *gateway) control(w http.ResponseWriter, r *http.Request) {
 					}
 				} else if g.claimController() {
 					controlling = true
+					g.quality.resetBaseline()
 					if g.clipboard != nil {
 						g.clipboard.attach(clipboardMessages)
 					}
