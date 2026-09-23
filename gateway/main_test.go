@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -370,41 +371,175 @@ func (writer *keyframeAcknowledgementWriter) Write(record []byte) (int, error) {
 
 func (writer *keyframeAcknowledgementWriter) Close() error { return nil }
 
+// stepQualityPolicy feeds one feedback report per second and returns the
+// number of quality changes the policy requested.
+func stepQualityPolicy(policy *qualityPolicy, now *time.Time, seconds int, queue uint32, dropped uint64, rtt float64) int {
+	changes := 0
+	for range seconds {
+		*now = now.Add(time.Second)
+		if policy.update(queue, dropped, rtt, *now) {
+			changes++
+		}
+	}
+	return changes
+}
+
 func TestQualityPolicyIgnoresDamageDrivenIdle(t *testing.T) {
 	now := time.Now()
 	policy := qualityPolicy{bitrate: 6000, fps: 60, scale: 100, maxBitrate: 6000, maxFPS: 60, last: now.Add(-time.Hour)}
-	for range 20 {
-		if policy.update(0, 0, 0, 20, false, now) {
-			t.Fatal("idle feedback changed quality")
-		}
+	// A static desktop at full quality reports an empty queue and a healthy
+	// link forever; that must not produce quality records.
+	if changes := stepQualityPolicy(&policy, &now, 60, 0, 0, 20); changes != 0 {
+		t.Fatalf("idle feedback at full quality changed quality %d times: %+v", changes, policy)
 	}
 }
 
 func TestQualityPolicyDownshiftsAndRecoversWithinStartupCeilings(t *testing.T) {
 	now := time.Now()
 	policy := qualityPolicy{bitrate: 6000, fps: 60, scale: 100, maxBitrate: 6000, maxFPS: 60, last: now.Add(-time.Hour)}
-	policy.update(6, 0, 60, 20, true, now)
-	if !policy.update(6, 0, 60, 20, true, now) || policy.bitrate >= 6000 {
+	policy.update(6, 0, 60, now)
+	if !policy.update(6, 0, 60, now) || policy.bitrate >= 6000 {
 		t.Fatalf("sustained queue did not downshift: %+v", policy)
 	}
 	if policy.fps != 60 || policy.scale != 100 {
 		t.Fatalf("first downshift sacrificed frame rate or resolution: %+v", policy)
 	}
-	for index := 0; index < 8; index++ {
-		policy.update(0, 0, 60, 20, true, now.Add(6*time.Second))
-	}
+	stepQualityPolicy(&policy, &now, 60, 0, 0, 60)
 	if policy.bitrate > policy.maxBitrate || policy.fps > policy.maxFPS || policy.scale > 100 {
 		t.Fatalf("recovery exceeded startup ceiling: %+v", policy)
+	}
+	if policy.bitrate != policy.maxBitrate {
+		t.Fatalf("healthy link did not recover bitrate: %+v", policy)
 	}
 }
 
 func TestQualityPolicyDoesNotTreatPresentationDropsAsCongestion(t *testing.T) {
 	now := time.Now()
 	policy := qualityPolicy{bitrate: 12000, fps: 30, scale: 100, maxBitrate: 12000, maxFPS: 30, last: now.Add(-time.Hour)}
-	for range 10 {
-		if policy.update(0, 30, 30, 20, true, now) {
-			t.Fatalf("presentation drops changed quality: %+v", policy)
+	if changes := stepQualityPolicy(&policy, &now, 10, 0, 30, 20); changes != 0 {
+		t.Fatalf("presentation drops changed quality: %+v", policy)
+	}
+}
+
+func TestQualityPolicyRecoversWhileDesktopIdle(t *testing.T) {
+	now := time.Now()
+	policy := qualityPolicy{bitrate: 6000, fps: 10, scale: 50, maxBitrate: 12000, maxFPS: 30, last: now}
+	// After a transient spike the desktop sits idle: damage-driven capture
+	// delivers no chunks, so the client renders nothing, yet the link is fine.
+	// Resolution must come back first because it is what blurs text.
+	seen := []string{}
+	for range 120 {
+		now = now.Add(time.Second)
+		if policy.update(0, 0, 20, now) {
+			seen = append(seen, fmt.Sprintf("%d/%d", policy.fps, policy.scale))
 		}
+	}
+	if policy.scale != 100 || policy.fps != 30 || policy.bitrate != 12000 {
+		t.Fatalf("idle desktop on a healthy link did not recover full quality: %+v (steps %v)", policy, seen)
+	}
+	want := []string{"10/75", "10/100", "20/100", "30/100", "30/100"}
+	for index, step := range want {
+		if index >= len(seen) || seen[index] != step {
+			t.Fatalf("recovery order %v, want prefix %v", seen, want)
+		}
+	}
+}
+
+func TestQualityPolicyJudgesRTTAgainstControllerBaseline(t *testing.T) {
+	now := time.Now()
+	policy := qualityPolicy{bitrate: 12000, fps: 30, scale: 100, maxBitrate: 12000, maxFPS: 30, last: now.Add(-time.Hour)}
+	// A viewer on another continent idles at 180 ms. That is its normal link,
+	// not congestion, and a modest rise above it is still not congestion.
+	if changes := stepQualityPolicy(&policy, &now, 20, 0, 0, 180); changes != 0 {
+		t.Fatalf("steady distant RTT changed quality: %+v", policy)
+	}
+	if changes := stepQualityPolicy(&policy, &now, 20, 0, 0, 300); changes != 0 {
+		t.Fatalf("RTT within the margin above the baseline changed quality: %+v", policy)
+	}
+	// A real spike well above the baseline still downshifts.
+	if changes := stepQualityPolicy(&policy, &now, 2, 0, 0, 400); changes != 1 || policy.bitrate == 12000 {
+		t.Fatalf("spike above the baseline did not downshift: changes=%d %+v", changes, policy)
+	}
+	// Back at its normal 180 ms the distant viewer must recover, which the
+	// fixed 120 ms threshold never allowed.
+	stepQualityPolicy(&policy, &now, 30, 0, 0, 180)
+	if policy.bitrate != 12000 {
+		t.Fatalf("distant viewer did not recover at its baseline RTT: %+v", policy)
+	}
+}
+
+func TestQualityPolicyKeepsFixedThresholdsForNearbyViewer(t *testing.T) {
+	now := time.Now()
+	policy := qualityPolicy{bitrate: 12000, fps: 30, scale: 100, maxBitrate: 12000, maxFPS: 30, last: now.Add(-time.Hour)}
+	stepQualityPolicy(&policy, &now, 5, 0, 0, 5)
+	if changes := stepQualityPolicy(&policy, &now, 2, 0, 0, 260); changes != 1 || policy.bitrate == 12000 {
+		t.Fatalf("nearby viewer at 260 ms did not downshift: changes=%d %+v", changes, policy)
+	}
+	// 110 ms is healthy for a nearby viewer even though it is far above its
+	// baseline.
+	stepQualityPolicy(&policy, &now, 30, 0, 0, 110)
+	if policy.bitrate != 12000 {
+		t.Fatalf("nearby viewer did not recover below the fixed threshold: %+v", policy)
+	}
+	// 130 ms is not healthy for a nearby viewer, so a downshift sticks.
+	stepQualityPolicy(&policy, &now, 2, 0, 0, 260)
+	degraded := policy.bitrate
+	stepQualityPolicy(&policy, &now, 30, 0, 0, 130)
+	if policy.bitrate != degraded {
+		t.Fatalf("nearby viewer recovered on a slow link: %+v", policy)
+	}
+}
+
+func TestQualityPolicyResetBaselineForgetsPreviousController(t *testing.T) {
+	now := time.Now()
+	policy := qualityPolicy{bitrate: 6000, fps: 30, scale: 100, maxBitrate: 12000, maxFPS: 30, last: now}
+	stepQualityPolicy(&policy, &now, 5, 0, 0, 5)
+	// Without a reset the distant controller inherits a 5 ms baseline and has
+	// to wait out the baseline window before it can look healthy.
+	stepQualityPolicy(&policy, &now, 30, 0, 0, 180)
+	if policy.bitrate != 6000 {
+		t.Fatalf("inherited baseline let the distant controller recover: %+v", policy)
+	}
+	policy.resetBaseline()
+	stepQualityPolicy(&policy, &now, 90, 0, 0, 180)
+	if policy.bitrate != 12000 {
+		t.Fatalf("distant controller did not recover after the baseline reset: %+v", policy)
+	}
+}
+
+func TestQualityPolicyBaselineFollowsALinkThatBecomesSlower(t *testing.T) {
+	now := time.Now()
+	policy := qualityPolicy{bitrate: 6000, fps: 30, scale: 100, maxBitrate: 12000, maxFPS: 30, last: now}
+	stepQualityPolicy(&policy, &now, 30, 0, 0, 5)
+	// The viewer moves to a slower network for good. Its old 5 ms baseline
+	// must not pin the healthy threshold at 120 ms forever.
+	stepQualityPolicy(&policy, &now, 3*60, 0, 0, 180)
+	if policy.bitrate != 12000 {
+		t.Fatalf("policy never adopted the slower link as its baseline: %+v", policy)
+	}
+	// A brief dip below the new baseline is adopted immediately.
+	stepQualityPolicy(&policy, &now, 1, 0, 0, 100)
+	if policy.baseRTT != 100 {
+		t.Fatalf("lower RTT did not lower the baseline at once: %+v", policy)
+	}
+}
+
+func TestQualityPolicySpendsFrameRateBeforeResolution(t *testing.T) {
+	now := time.Now()
+	policy := qualityPolicy{bitrate: 6000, fps: 30, scale: 100, maxBitrate: 12000, maxFPS: 30, last: now}
+	seen := []string{}
+	for range 6 {
+		now = now.Add(6 * time.Second)
+		policy.update(6, 0, 20, now)
+		changed := policy.update(6, 0, 20, now)
+		seen = append(seen, fmt.Sprintf("%d/%d/%v", policy.fps, policy.scale, changed))
+	}
+	// Every frame-rate step down to streamd's minimum comes before any
+	// resolution step, and the floor reports no change instead of re-sending
+	// the same quality record.
+	want := []string{"20/100/true", "10/100/true", "10/75/true", "10/50/true", "10/50/false", "10/50/false"}
+	if strings.Join(seen, " ") != strings.Join(want, " ") {
+		t.Fatalf("downshift order %v, want %v", seen, want)
 	}
 }
 
