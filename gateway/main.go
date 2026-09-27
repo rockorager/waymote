@@ -409,6 +409,10 @@ func (p *qualityPolicy) update(queue uint32, dropped uint64, rtt float64, now ti
 }
 
 func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
+	if !authorizedRequest(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	clientID := g.nextClientID.Add(1)
 	originPatterns := []string(nil)
 	if g.allowedOrigin != "" {
@@ -478,6 +482,21 @@ func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func authorizedRequest(r *http.Request) bool {
+	token := os.Getenv("WAYMOTE_AUTH_TOKEN")
+	if token == "" {
+		return true
+	}
+	provided := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(provided) > len(prefix) && provided[:len(prefix)] == prefix {
+		provided = provided[len(prefix):]
+	} else {
+		provided = r.URL.Query().Get("token")
+	}
+	return provided != "" && provided == token
+}
+
 func encodeVideoMessage(frame sample) []byte {
 	message := make([]byte, videoHeaderSize+len(frame.data))
 	message[0] = protocolVersion
@@ -514,6 +533,10 @@ func encodeAudioMessage(packet audioSample) []byte {
 }
 
 func (g *gateway) streamAudio(w http.ResponseWriter, r *http.Request) {
+	if !authorizedRequest(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	clientID := g.nextClientID.Add(1)
 	originPatterns := []string(nil)
 	if g.allowedOrigin != "" {
@@ -688,6 +711,10 @@ func (bridge *inputBridge) write(record []byte) error {
 }
 
 func (g *gateway) control(w http.ResponseWriter, r *http.Request) {
+	if !authorizedRequest(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
 	clientID := g.nextClientID.Add(1)
 	originPatterns := []string(nil)
 	if g.allowedOrigin != "" {
