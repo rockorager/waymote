@@ -5,12 +5,19 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            architecture: aarch64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,7 +32,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
       - name: Install native dependencies
         run: |
           sudo apt-get update
@@ -51,24 +57,63 @@ jobs:
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct HEAD)"
           scripts/package-release "${GITHUB_REF_NAME#v}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-server-${{ matrix.architecture }}
+          path: zig-out/release/waymote-server-*-linux-${{ matrix.architecture }}.tar.gz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: matrix.architecture == 'x86_64'
+        with:
+          name: release-sdk
+          path: |
+            zig-out/release/waymote-sdk-*.tar.gz
+            zig-out/release/*.tgz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Check artifacts and generate checksums
+        working-directory: dist
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          test -f "waymote-server-$version-linux-x86_64.tar.gz"
+          test -f "waymote-server-$version-linux-aarch64.tar.gz"
+          test -f "waymote-sdk-$version.tar.gz"
+          sha256sum ./*.tar.gz ./*.tgz | sort -k2 >SHA256SUMS
       - name: Publish npm package
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           tag=latest
           [[ "${GITHUB_REF_NAME#v}" == *-* ]] && tag=next
-          npm publish --access public --provenance --tag "$tag"
-        working-directory: zig-out/release/npm
+          npm publish ./*.tgz --access public --provenance --tag "$tag"
+        working-directory: dist
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           options=()
           [[ "${GITHUB_REF_NAME#v}" == *-* ]] && options+=(--prerelease)
           gh release create "$GITHUB_REF_NAME" \
-            zig-out/release/*.tar.gz \
-            zig-out/release/*.tgz \
-            zig-out/release/SHA256SUMS \
+            dist/*.tar.gz \
+            dist/*.tgz \
+            dist/SHA256SUMS \
             --title "Waymote ${GITHUB_REF_NAME#v}" \
             --generate-notes \
             "${options[@]}"

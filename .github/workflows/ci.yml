@@ -11,7 +11,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
@@ -39,3 +43,12 @@ jobs:
           npx --yes --package typescript@5.7.3 tsc \
             --noEmit --skipLibCheck false --lib ES2022,DOM gateway/sdk/waymote.d.ts
           npm pack --dry-run ./gateway/sdk
+      - name: Smoke test release archive
+        run: |
+          scripts/package-release 0.1.0-ci.0
+          (cd zig-out/release && sha256sum --check SHA256SUMS)
+          directory="$(mktemp -d)"
+          trap 'rm -rf "$directory"' EXIT
+          tar -xzf zig-out/release/waymote-server-*.tar.gz -C "$directory"
+          "$directory"/waymote-server-*/bin/waymote-gateway --version | grep -F 'waymote-gateway 0.1.0-ci.0 '
+          "$directory"/waymote-server-*/bin/waymote-streamd --version | grep -F 'waymote-streamd 0.1.0-ci.0 '
