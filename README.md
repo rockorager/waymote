@@ -107,8 +107,8 @@ browser input and clipboard
 ```
 
 The server requires FFmpeg with `libx264`, a Pulse-compatible audio source for
-audio, and the relevant Wayland protocols. The release archive currently
-targets Linux x86-64.
+audio, and the relevant Wayland protocols. Server release archives target
+Linux x86-64 and ARM64 (`aarch64`).
 
 ## Compositor compatibility
 
@@ -155,7 +155,7 @@ Waymote is an early release and currently has these constraints:
   independently from video and input.
 - Slow viewers drop stale encoded frames and resume at the next keyframe rather
   than accumulating latency.
-- Linux x86-64 is the first packaged server target.
+- Packaged servers target Linux x86-64 and ARM64.
 
 The binary protocol is documented separately in
 [`docs/protocol.md`](docs/protocol.md).
