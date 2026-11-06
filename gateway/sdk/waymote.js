@@ -191,6 +191,27 @@ const linuxKeyCodes = new Map([
   ["F16", 186], ["F17", 187], ["F18", 188], ["F19", 189],
   ["F20", 190], ["F21", 191], ["F22", 192], ["F23", 193], ["F24", 194],
 ]);
+// US-layout key and Shift state of each character an on-screen keyboard can
+// type as a shortcut key while sticky modifiers are latched.
+const characterKeys = new Map();
+for (const [code, key] of linuxKeyCodes) {
+  if (/^Key[A-Z]$/.test(code)) {
+    characterKeys.set(code[3].toLowerCase(), [key, false]);
+    characterKeys.set(code[3], [key, true]);
+  } else if (/^Digit\d$/.test(code)) {
+    characterKeys.set(code[5], [key, false]);
+    characterKeys.set(")!@#$%^&*("[Number(code[5])], [key, true]);
+  }
+}
+for (const [code, plain, shifted] of [
+  ["Minus", "-", "_"], ["Equal", "=", "+"], ["BracketLeft", "[", "{"],
+  ["BracketRight", "]", "}"], ["Backslash", "\\", "|"], ["Semicolon", ";", ":"],
+  ["Quote", "'", "\""], ["Backquote", "`", "~"], ["Comma", ",", "<"],
+  ["Period", ".", ">"], ["Slash", "/", "?"], ["Space", " ", null],
+]) {
+  characterKeys.set(plain, [linuxKeyCodes.get(code), false]);
+  if (shifted) characterKeys.set(shifted, [linuxKeyCodes.get(code), true]);
+}
 
 let controlSocket = null;
 let controlReconnectDelay = 250;
@@ -229,6 +250,13 @@ const resizeRequests = new Map();
 let resizeState = "idle";
 const pressedKeys = new Set();
 const pressedButtons = new Set();
+// One-shot modifiers latched by the application, for example from an on-screen
+// key strip. They wrap the next non-modifier key press (hardware key, on-screen
+// keyboard character, or tapKey) and are then cleared.
+let stickyModifiers = [];
+// Sticky modifiers the remote holds for a hardware key, released with that key.
+let stickyHeld = [];
+let stickyHeldKey = null;
 // Swap Command (Super) and Control for hardware keys, for a host whose primary
 // shortcut modifier differs from the remote's (a Mac browser on a Linux desktop).
 let swapCommandControl = false;
@@ -538,7 +566,7 @@ function remotePasteModifier() {
 }
 
 function pasteClipboardText(text, modifiers) {
-  if (!sendClipboardText(text)) return;
+  if (!sendClipboardText(text)) return false;
 
   // Release unrelated modifiers during paste, then restore physically held keys
   // for their eventual keyup.
@@ -547,6 +575,64 @@ function pasteClipboardText(text, modifiers) {
   for (const key of released) sendControl(keyboardRecord(key, keyReleased));
   tapRemoteKey(47, modifiers);
   for (const key of released) sendControl(keyboardRecord(key, keyPressed));
+  return true;
+}
+
+function pasteText(text) {
+  if (!controlActive) return false;
+  return pasteClipboardText(text, [remotePasteModifier()]);
+}
+
+function setStickyModifiers(keys) {
+  const next = [...new Set(keys)].filter((key) => modifierKeys.has(key));
+  if (next.length === stickyModifiers.length &&
+      next.every((key, index) => key === stickyModifiers[index])) {
+    return;
+  }
+  stickyModifiers = next;
+  owner.updateState("input", { stickyModifiers: Object.freeze([...next]) });
+}
+
+// Consumes the latch for one key press: returns the caller's modifiers plus the
+// sticky ones and clears the latch.
+function takeStickyModifiers(modifiers = []) {
+  if (stickyModifiers.length === 0) return modifiers;
+  const combined = [...modifiers];
+  for (const key of stickyModifiers) if (!combined.includes(key)) combined.push(key);
+  setStickyModifiers([]);
+  return combined;
+}
+
+// Presses the sticky modifiers around a hardware key so that its own keyup
+// releases them. Modifiers the user physically holds stay theirs.
+function holdStickyModifiersFor(key) {
+  if (stickyModifiers.length === 0 || modifierKeys.has(key)) return;
+  releaseStickyHeld();
+  stickyHeldKey = key;
+  stickyHeld = takeStickyModifiers().filter((modifier) => !pressedKeys.has(modifier));
+  for (const modifier of stickyHeld) sendControl(keyboardRecord(modifier, keyPressed));
+}
+
+function releaseStickyHeld() {
+  for (const modifier of stickyHeld) {
+    if (!pressedKeys.has(modifier)) sendControl(keyboardRecord(modifier, keyReleased));
+  }
+  stickyHeld = [];
+  stickyHeldKey = null;
+}
+
+function clearStickyState() {
+  stickyHeld = [];
+  stickyHeldKey = null;
+  setStickyModifiers([]);
+}
+
+function tapKey(key, modifiers) {
+  if (!controlActive || controlSocket?.readyState !== WebSocket.OPEN) return false;
+  // A lone modifier tap (Super opens the launcher on many desktops) leaves the
+  // latch for the next key; any other key consumes it.
+  tapRemoteKey(key, modifierKeys.has(key) ? modifiers : takeStickyModifiers(modifiers));
+  return true;
 }
 
 function applePlatform() {
@@ -929,6 +1015,7 @@ function releaseInput() {
   clipboardPasteModifiers = null;
   pressedKeys.clear();
   pressedButtons.clear();
+  clearStickyState();
   sendControl(controlRecord(controlReleaseAll, false, 0, 0, 0));
 }
 
@@ -1105,6 +1192,7 @@ async function connectControl() {
       pendingPointerPosition = null;
       pressedKeys.clear();
       pressedButtons.clear();
+      clearStickyState();
       setControlStatus("Input in use");
       if (controlAcquireTimer === null) {
         controlAcquireTimer = setTimeout(retryControlAcquire, controlAcquireDelay);
@@ -1128,6 +1216,7 @@ async function connectControl() {
     pendingControlRecords = [];
     pressedKeys.clear();
     pressedButtons.clear();
+    clearStickyState();
     if (controlAcquireTimer !== null) {
       clearTimeout(controlAcquireTimer);
       controlAcquireTimer = null;
@@ -1285,7 +1374,20 @@ function handleKeyDown(event) {
     event.stopPropagation();
     return;
   }
+  // iOS on-screen keyboards report each symbol on the US key that types it,
+  // but with the Shift state of their current page: "!" arrives as Digit1
+  // without Shift and "'" on the symbols page as Quote with Shift. Without
+  // resolved keysyms the remote would type that key's other character, so let
+  // the text input's beforeinput commit the character as text instead.
+  const usCharacter = characterKeys.get(event.key);
+  if (!supportsResolvedKeysyms && event.currentTarget === imeProxy && !event.ctrlKey &&
+      !event.metaKey && !event.altKey && usCharacter?.[0] === key &&
+      usCharacter[1] !== event.shiftKey) {
+    physicalTextPending = false;
+    return;
+  }
   if (!pressedKeys.has(key)) {
+    holdStickyModifiersFor(key);
     pressedKeys.add(key);
     sendControl(keyboardRecord(
       key,
@@ -1336,12 +1438,14 @@ function handleKeyUp(event) {
       if (!modifierKeys.has(held)) {
         pressedKeys.delete(held);
         sendControl(keyboardRecord(held, keyReleased));
+        if (held === stickyHeldKey) releaseStickyHeld();
       }
     }
   }
   if (pressedKeys.delete(key)) {
     sendControl(keyboardRecord(key, keyReleased));
   }
+  if (key === stickyHeldKey) releaseStickyHeld();
   physicalTextPending = false;
   event.preventDefault();
   event.stopPropagation();
@@ -1623,6 +1727,12 @@ function handleBeforeInput(event) {
   if (physicalTextPending || suppressCompositionText === event.data) {
     physicalTextPending = false;
     suppressCompositionText = null;
+    event.preventDefault();
+  } else if (controlActive && stickyModifiers.length > 0 && characterKeys.has(event.data)) {
+    // A character typed on an on-screen keyboard with latched modifiers is a
+    // shortcut such as Command-C, so send it as that key rather than as text.
+    const [key, shifted] = characterKeys.get(event.data);
+    tapRemoteKey(key, takeStickyModifiers(shifted ? [42] : []));
     event.preventDefault();
   } else if (controlActive) {
     controlSocket.send(JSON.stringify({
@@ -2247,14 +2357,17 @@ return {
   enableAudio,
   getAudioMuted: () => audioMuted,
   getRemoteClipboard: () => remoteClipboard,
+  pasteText,
   remoteDisplayPolicyChanged,
   requestControl,
   releaseControl,
   sendClipboardText,
   setLatencyTarget,
   setMuted,
+  setStickyModifiers,
   setSwapCommandControl,
   setVolume,
+  tapKey,
 };
 }
 
@@ -2264,6 +2377,15 @@ function positiveNumber(value, name) {
     throw new RangeError(`${name} must be a positive number`);
   }
   return value;
+}
+
+// The gateway closes the control socket on a keyboard record outside 1-255.
+function linuxKeyCode(value) {
+  const key = Number(value);
+  if (!Number.isInteger(key) || key <= 0 || key > 255) {
+    throw new RangeError(`Invalid Linux key code: ${value}`);
+  }
+  return key;
 }
 
 function normalizeRemoteDisplayPolicy(policy) {
@@ -2326,6 +2448,7 @@ export class WaymoteSession {
         message: "Input idle",
         connected: false,
         pointerLocked: false,
+        stickyModifiers: Object.freeze([]),
       }),
       audio: Object.freeze({
         state: "idle",
@@ -2386,6 +2509,18 @@ export class WaymoteSession {
       setSwapCommandControl: (enabled) => {
         this.#assertActive();
         this.#runtime.setSwapCommandControl(enabled);
+      },
+      tapKey: (key, modifiers = []) => {
+        this.#assertActive();
+        return this.#runtime.tapKey(linuxKeyCode(key), [...modifiers].map(linuxKeyCode));
+      },
+      setStickyModifiers: (keys) => {
+        this.#assertActive();
+        this.#runtime.setStickyModifiers([...keys].map(linuxKeyCode));
+      },
+      pasteText: (text) => {
+        this.#assertActive();
+        return this.#runtime.pasteText(String(text));
       },
     });
     this.clipboard = Object.freeze({

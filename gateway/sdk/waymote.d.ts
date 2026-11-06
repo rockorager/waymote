@@ -66,6 +66,8 @@ export interface InputState {
   readonly message: string;
   readonly connected: boolean;
   readonly pointerLocked: boolean;
+  /** Linux key codes of the one-shot modifiers latched for the next key press. */
+  readonly stickyModifiers: readonly number[];
 }
 
 export interface AudioState {
@@ -174,6 +176,26 @@ export interface InputController {
    * Defaults to false.
    */
   setSwapCommandControl(enabled: boolean): void;
+  /**
+   * Presses and releases one key on the remote, holding the given modifier keys
+   * around it, plus any latched sticky modifiers, which this consumes unless the
+   * key is itself a modifier. Keys are Linux key codes from 1 to 255. Returns
+   * false when input control is not active.
+   */
+  tapKey(key: number, modifiers?: readonly number[]): boolean;
+  /**
+   * Latches one-shot modifiers (Linux key codes of Shift, Ctrl, Alt, or Super;
+   * other keys are ignored). They wrap the next non-modifier key press, whether
+   * from a hardware key, a character typed on an on-screen keyboard, or tapKey,
+   * and are then cleared. Reflected in InputState.stickyModifiers.
+   */
+  setStickyModifiers(keys: readonly number[]): void;
+  /**
+   * Writes text to the remote clipboard and taps the remote's own paste
+   * shortcut. Returns false when input control is not active or the text
+   * exceeds the clipboard limit.
+   */
+  pasteText(text: string): boolean;
 }
 
 export interface ClipboardController {

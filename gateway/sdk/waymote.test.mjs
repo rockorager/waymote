@@ -1412,3 +1412,131 @@ test("Command and Control can be swapped for hardware keys", async (t) => {
     ]);
   });
 });
+
+test("sticky modifiers and tapped keys for on-screen key strips", async (t) => {
+  await t.test("tapKey consumes the latch and reports it in the input state", async (t) => {
+    const { session, messages } = await controlledSession(t);
+    const latched = [];
+    session.on("state", (state) => latched.push(state.input.stickyModifiers));
+    session.input.setStickyModifiers([125, 15, 125]);
+    session.input.setStickyModifiers([125]);
+    assert.deepEqual(session.state.input.stickyModifiers, [125]);
+    assert.equal(session.input.tapKey(15, [56]), true);
+    assert.deepEqual(session.state.input.stickyModifiers, []);
+    assert.deepEqual(latched, [[125], []]);
+    assert.deepEqual(messages(), [[56, 1], [125, 1], [15, 1], [15, 0], [56, 0], [125, 0]]);
+  });
+
+  await t.test("a lone modifier tap keeps the latch and held keys stay held", async (t) => {
+    const { session, keyEvent, messages, control } = await controlledSession(t);
+    session.input.setStickyModifiers([42]);
+    session.input.tapKey(125);
+    assert.deepEqual(session.state.input.stickyModifiers, [42]);
+    assert.deepEqual(messages(), [[125, 1], [125, 0]]);
+    session.input.setStickyModifiers([]);
+    keyEvent("keydown", "ShiftLeft", { shiftKey: true });
+    control.sent.length = 0;
+    session.input.tapKey(15, [42]);
+    assert.deepEqual(messages(), [[42, 1], [15, 1], [15, 0]]);
+    assert.throws(() => session.input.tapKey(256), RangeError);
+    assert.throws(() => session.input.tapKey(15, [Number.NaN]), RangeError);
+  });
+
+  await t.test("the latch wraps the next hardware key and is released with it", async (t) => {
+    const { session, keyEvent, messages } = await controlledSession(t);
+    session.input.setStickyModifiers([125]);
+    keyEvent("keydown", "ShiftLeft", { shiftKey: true });
+    assert.deepEqual(session.state.input.stickyModifiers, [125]);
+    session.input.setStickyModifiers([29, 42]);
+    keyEvent("keydown", "KeyA", { key: "A", shiftKey: true });
+    assert.deepEqual(session.state.input.stickyModifiers, []);
+    keyEvent("keyup", "KeyA", { key: "A", shiftKey: true });
+    keyEvent("keydown", "KeyB", { key: "B", shiftKey: true });
+    keyEvent("keyup", "KeyB", { key: "B", shiftKey: true });
+    keyEvent("keyup", "ShiftLeft");
+    // Shift is physically held, so only the user's keyup releases it.
+    assert.deepEqual(messages(), [
+      [42, 1], [29, 1], [30, 1], [30, 0], [29, 0], [48, 1], [48, 0], [42, 0],
+    ]);
+  });
+
+  await t.test("Command release on Apple also releases the latch of a lost keyup", async (t) => {
+    const { session, keyEvent, messages } = await controlledSession(t, { platform: "MacIntel" });
+    keyEvent("keydown", "MetaLeft", { metaKey: true });
+    session.input.setStickyModifiers([56]);
+    keyEvent("keydown", "KeyZ", { metaKey: true });
+    keyEvent("keyup", "MetaLeft");
+    keyEvent("keyup", "KeyZ");
+    assert.deepEqual(messages(), [[125, 1], [56, 1], [44, 1], [44, 0], [56, 0], [125, 0]]);
+  });
+
+  await t.test("characters typed with a latch become shortcut keys", async (t) => {
+    const { session, beforeInput, messages } = await controlledSession(t);
+    session.input.setStickyModifiers([125]);
+    assert.equal(beforeInput("c").defaultPrevented, true);
+    session.input.setStickyModifiers([29]);
+    beforeInput("?");
+    beforeInput("x");
+    session.input.setStickyModifiers([29]);
+    beforeInput("é");
+    assert.deepEqual(session.state.input.stickyModifiers, [29]);
+    assert.deepEqual(messages().map((message) => message.text ?? message), [
+      [125, 1], [46, 1], [46, 0], [125, 0],
+      [42, 1], [29, 1], [53, 1], [53, 0], [42, 0], [29, 0],
+      "x", "é",
+    ]);
+  });
+
+  await t.test("losing control clears the latch and disables tapping", async (t) => {
+    const { session, receive, messages } = await controlledSession(t);
+    session.input.setStickyModifiers([125]);
+    receive({ type: "control-state", state: "busy" });
+    assert.deepEqual(session.state.input.stickyModifiers, []);
+    assert.equal(session.input.tapKey(15), false);
+    assert.equal(session.input.pasteText("not sent"), false);
+    receive({ type: "control-state", state: "active" });
+    session.input.setStickyModifiers([125]);
+    session.input.release();
+    assert.deepEqual(session.state.input.stickyModifiers, []);
+    assert.deepEqual(messages().filter((message) => Array.isArray(message)), []);
+  });
+
+  await t.test("pasteText taps the remote paste shortcut", async (t) => {
+    const { session, messages } = await controlledSession(t, { remotePlatform: "macos" });
+    assert.equal(session.input.pasteText("from the strip"), true);
+    assert.equal(session.input.pasteText("é".repeat(512 * 1024 + 1)), false);
+    assert.deepEqual(messages(), [
+      { type: "clipboard-write", text: "from the strip" }, [125, 1], [47, 1], [47, 0], [125, 0],
+    ]);
+  });
+});
+
+test("iOS keyboard symbols are typed as text without resolved keysyms", async (t) => {
+  const { receive, keyEvent, beforeInput, textInput, messages, control } = await controlledSession(t);
+  const softKey = (code, character, shiftKey) => {
+    keyEvent("keydown", code, { key: character, shiftKey }, textInput);
+    beforeInput(character);
+    keyEvent("keyup", code, { key: character }, textInput);
+  };
+  const sent = () => messages().map((message) => message.text ?? message);
+  // The iOS keyboard sends Shift then "A" on the letters page, "!" on the 123
+  // page as Digit1 without Shift, and "'" on the #+= page with Shift held.
+  keyEvent("keydown", "ShiftLeft", { key: "Shift", shiftKey: true }, textInput);
+  softKey("KeyA", "A", true);
+  keyEvent("keyup", "ShiftLeft", { key: "Shift" }, textInput);
+  softKey("Digit1", "!", false);
+  keyEvent("keydown", "ShiftLeft", { key: "Shift", shiftKey: true }, textInput);
+  softKey("Quote", "'", true);
+  keyEvent("keyup", "ShiftLeft", { key: "Shift" }, textInput);
+  // A hardware keyboard on the canvas keeps physical keys.
+  keyEvent("keydown", "Digit1", { key: "!" });
+  keyEvent("keyup", "Digit1", { key: "!" });
+  assert.deepEqual(sent(), [
+    [42, 1], [30, 1], [30, 0], [42, 0], "!", [42, 1], "'", [42, 0], [2, 1], [2, 0],
+  ]);
+
+  receive({ type: "control-state", state: "active", resolvedKeysyms: true });
+  control.sent.length = 0;
+  softKey("Digit1", "!", false);
+  assert.deepEqual(sent(), [[2, 1], [2, 0]]);
+});

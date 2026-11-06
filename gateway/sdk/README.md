@@ -76,6 +76,21 @@ The gateway's `-xkb-layout` setting remains the fallback for older browser clien
 for hardware keys, so a Mac user's Command-C reaches a Linux desktop as Ctrl-C.
 The platform paste gesture keeps working either way.
 
+Touch devices have no Ctrl, Alt, Esc, or arrow keys, so applications can draw
+their own key strip. `session.input.tapKey(key, modifiers)` taps one Linux key
+code with the given modifiers held. `session.input.setStickyModifiers(keys)`
+latches one-shot modifiers, reported in `state.input.stickyModifiers`, for the
+next non-modifier key, whether it comes from `tapKey`, a hardware key, or a
+character typed on the on-screen keyboard, which is then sent as a shortcut key
+(Ctrl and "c" become Ctrl-C). `session.input.pasteText(text)` writes text to
+the remote clipboard and taps the remote paste shortcut.
+
+```ts
+session.input.setStickyModifiers([29]); // Ctrl for the next key
+session.input.tapKey(15); // Ctrl-Tab
+session.input.tapKey(1); // Esc
+```
+
 The browser's native paste shortcut (Command-V on Apple platforms, Ctrl-V
 elsewhere) sends local clipboard text and pastes remotely with Ctrl-V; adding
 Shift uses Ctrl-Shift-V. Ctrl-V on macOS passes through to the remote application
