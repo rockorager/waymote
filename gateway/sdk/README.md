@@ -67,6 +67,26 @@ viewport-driven sizing with `session.remoteDisplay.observe({ element })`.
 Changing the canvas's CSS or backing dimensions never implicitly resizes the
 remote compositor.
 
+A server that captures one of several host displays can let viewers choose
+among them. The Waymote gateway does not; `session.displays.state` stays `null`
+and `session.displays.select(id)` returns `false` unless the server sends a
+`display-state` message on the control socket:
+
+```json
+{ "type": "display-state", "displays": [{ "id": "1", "name": "Built-in",
+  "width": 3024, "height": 1964, "isMain": true }], "selectedID": "1",
+  "generation": 3, "switching": false }
+```
+
+`generation` is the video generation that shows the selected display, and an
+optional `error` string reports a failed switch. Selecting a display sends
+`{ "type": "display-select", "id": "2" }` once the viewer holds input control.
+Input, text, and clipboard writes are suppressed from the selection until a
+frame of the reported generation is drawn; the SDK then sends
+`{ "type": "display-presented", "generation": 4 }` and resumes input. The
+`displays` event reports each change, including `null` when the control
+connection closes.
+
 Printable keyboard input follows the layout resolved by the browser, so users
 do not need to select their local keyboard layout in the application. Ctrl,
 Meta, and ordinary Alt shortcuts remain physical-key shortcuts except for paste.

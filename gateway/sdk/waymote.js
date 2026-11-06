@@ -240,6 +240,12 @@ let shortcutClipboardCopy = null;
 let inputSequence = 0;
 let supportsResolvedKeysyms = false;
 let currentGeneration = 0;
+// Display selection is active only after the server sends display-state.
+let displayState = null;
+let pendingDisplayID = null;
+let requiredDisplayGeneration = null;
+let presentedGeneration = 0;
+const frameGenerations = new WeakMap();
 let latestAppliedInput = 0;
 let droppedFrames = 0;
 let intervalChunks = 0;
@@ -265,6 +271,94 @@ let suppressCompositionText = null;
 let compositionTimer = null;
 function emit(type, value) {
   owner.emit(type, value);
+}
+
+// Input is accepted while this viewer controls the desktop and no display
+// switch is in progress. During a switch, input would land on the old display
+// or in coordinates of a display the user cannot see yet.
+function inputAccepted() {
+  return controlActive && !displayState?.switching;
+}
+
+function setDisplayState(state) {
+  displayState = state === null ? null : Object.freeze(state);
+  emit("displays", displayState);
+}
+
+function resetDisplays() {
+  pendingDisplayID = null;
+  requiredDisplayGeneration = null;
+  if (displayState !== null) setDisplayState(null);
+}
+
+// Resumes input once a frame of the selected display's generation has been
+// drawn, so the user sees the display that pointer coordinates refer to.
+function acknowledgeDisplay() {
+  if (requiredDisplayGeneration === null || presentedGeneration < requiredDisplayGeneration ||
+      controlSocket?.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  controlSocket.send(JSON.stringify({ type: "display-presented", generation: presentedGeneration }));
+  requiredDisplayGeneration = null;
+  // Keys pressed while the display was unavailable must not remain logically held.
+  pressedKeys.clear();
+  pressedButtons.clear();
+  clearStickyState();
+  pendingPointerPosition = null;
+  setDisplayState({ ...displayState, switching: false });
+}
+
+function receiveDisplayState(message) {
+  if (!Array.isArray(message.displays) || !message.displays.every((item) =>
+      item && typeof item.id === "string" && typeof item.name === "string" &&
+      Number.isInteger(item.width) && item.width > 0 &&
+      Number.isInteger(item.height) && item.height > 0 && typeof item.isMain === "boolean") ||
+      !Number.isInteger(message.generation) || message.generation < 0 ||
+      typeof message.switching !== "boolean" ||
+      (message.selectedID != null &&
+        !message.displays.some((item) => item.id === message.selectedID))) {
+    return;
+  }
+  releaseInput();
+  pendingDisplayID = null;
+  requiredDisplayGeneration = !message.switching && message.generation > 0
+    ? message.generation
+    : null;
+  setDisplayState({
+    displays: Object.freeze(message.displays.map((item) => Object.freeze({
+      id: item.id,
+      name: item.name,
+      width: item.width,
+      height: item.height,
+      isMain: item.isMain,
+    }))),
+    selectedID: message.selectedID ?? null,
+    generation: message.generation,
+    switching: message.switching || requiredDisplayGeneration !== null,
+    error: typeof message.error === "string" ? message.error : null,
+  });
+  acknowledgeDisplay();
+}
+
+function sendDisplaySelection() {
+  if (pendingDisplayID === null || !controlActive) return;
+  releaseInput();
+  controlSocket.send(JSON.stringify({ type: "display-select", id: pendingDisplayID }));
+  pendingDisplayID = null;
+}
+
+function selectDisplay(id) {
+  if (!displayState || displayState.switching || controlSocket?.readyState !== WebSocket.OPEN ||
+      !displayState.displays.some((item) => item.id === id)) {
+    return false;
+  }
+  if (id === displayState.selectedID) return true;
+  pendingDisplayID = id;
+  requiredDisplayGeneration = null;
+  setDisplayState({ ...displayState, switching: true, error: null });
+  if (controlActive) sendDisplaySelection();
+  else requestControl();
+  return true;
 }
 
 function websocketURL(path) {
@@ -530,6 +624,7 @@ async function enableAudio() {
 }
 
 function sendClipboardText(text) {
+  if (displayState?.switching) return false;
   if (new TextEncoder().encode(text).byteLength > maximumClipboardBytes) {
     setClipboardStatus("Clipboard is too large");
     return false;
@@ -628,7 +723,7 @@ function clearStickyState() {
 }
 
 function tapKey(key, modifiers) {
-  if (!controlActive || controlSocket?.readyState !== WebSocket.OPEN) return false;
+  if (!inputAccepted() || controlSocket?.readyState !== WebSocket.OPEN) return false;
   // A lone modifier tap (Super opens the launcher on many desktops) leaves the
   // latch for the next key; any other key consumes it.
   tapRemoteKey(key, modifierKeys.has(key) ? modifiers : takeStickyModifiers(modifiers));
@@ -990,6 +1085,10 @@ function scheduleResize() {
 }
 
 function sendControl(record) {
+  const type = new DataView(record).getUint8(1);
+  if (displayState?.switching && type !== controlReleaseAll && type !== controlResize) {
+    return false;
+  }
   if (!controlSocket) {
     return false;
   }
@@ -1136,6 +1235,7 @@ async function connectControl() {
       supportsResolvedKeysyms = message.resolvedKeysyms === true;
     }
     if (message.type !== "control-state") {
+      if (message.type === "display-state") receiveDisplayState(message);
       if (message.type === "pong" && pings.has(message.id)) {
         const received = performance.now();
         const sent = pings.get(message.id);
@@ -1187,7 +1287,16 @@ async function connectControl() {
         lastResizeRequest = null;
         sendResize();
       }
+      sendDisplaySelection();
     } else if (message.state === "busy" && controlWanted) {
+      if (pendingDisplayID !== null) {
+        pendingDisplayID = null;
+        setDisplayState({
+          ...displayState,
+          switching: false,
+          error: "Another viewer is controlling the desktop.",
+        });
+      }
       lastResizeRequest = null;
       pendingPointerPosition = null;
       pressedKeys.clear();
@@ -1211,6 +1320,7 @@ async function connectControl() {
     }
     controlSocket = null;
     controlActive = false;
+    resetDisplays();
     supportsResolvedKeysyms = false;
     lastResizeRequest = null;
     pendingControlRecords = [];
@@ -1513,6 +1623,12 @@ async function configureDecoder(configuration) {
 
   const configuredDecoder = new VideoDecoder({
     output(frame) {
+      // A replaced decoder can still deliver frames of the previous stream.
+      if (decoder !== configuredDecoder) {
+        frame.close();
+        return;
+      }
+      frameGenerations.set(frame, currentGeneration);
       pendingFrames.push(frame);
       if (pendingFrames.length > 24) {
         pendingFrames.shift().close();
@@ -1593,6 +1709,8 @@ function renderFrame() {
     display.height = frame.displayHeight;
   }
   context.drawImage(frame, 0, 0, display.width, display.height);
+  presentedGeneration = frameGenerations.get(frame) ?? 0;
+  acknowledgeDisplay();
   const presentation = expectedPresentationTime(frame.timestamp);
   videoLateness = presentation === null ? 0 : now - presentation;
   lastVideoCaptureMicros = frame.timestamp;
@@ -1650,6 +1768,8 @@ function decodeMessage(buffer) {
   latestAppliedInput = view.getUint32(36, true);
   if (generation !== currentGeneration) {
     currentGeneration = generation;
+    // Frames of the previous generation must not be presented after it ends.
+    for (const stale of pendingFrames.splice(0)) stale.close();
     decoder.reset(); decoder.configure(decoderConfiguration); waitingForKeyframe = true;
   }
   for (const [id, request] of resizeRequests) {
@@ -1695,13 +1815,13 @@ function requestKeyframe() {
 }
 
 function handleCompositionUpdate(event) {
-  if (controlActive) {
+  if (inputAccepted()) {
     controlSocket.send(JSON.stringify({ type: "text", action: "preedit", text: event.data, sequence: nextInputSequence() }));
   }
 }
 
 function handleCompositionEnd(event) {
-  if (controlActive) {
+  if (inputAccepted()) {
     controlSocket.send(JSON.stringify({
       type: "text",
       action: "commit",
@@ -1728,13 +1848,13 @@ function handleBeforeInput(event) {
     physicalTextPending = false;
     suppressCompositionText = null;
     event.preventDefault();
-  } else if (controlActive && stickyModifiers.length > 0 && characterKeys.has(event.data)) {
+  } else if (inputAccepted() && stickyModifiers.length > 0 && characterKeys.has(event.data)) {
     // A character typed on an on-screen keyboard with latched modifiers is a
     // shortcut such as Command-C, so send it as that key rather than as text.
     const [key, shifted] = characterKeys.get(event.data);
     tapRemoteKey(key, takeStickyModifiers(shifted ? [42] : []));
     event.preventDefault();
-  } else if (controlActive) {
+  } else if (inputAccepted()) {
     controlSocket.send(JSON.stringify({
       type: "text",
       action: "commit",
@@ -1751,7 +1871,7 @@ function handleTextInputFocus() {
 }
 
 function handleTextInputBlur(event) {
-  if (controlActive) {
+  if (inputAccepted()) {
     controlSocket.send(JSON.stringify({
       type: "text",
       action: "preedit",
@@ -1825,6 +1945,7 @@ async function connectVideo() {
   }
   videoConnectAttempt = null;
   videoSocket = socket;
+  presentedGeneration = 0;
   function queuePendingDecoderMessage(data) {
     if (!(data instanceof ArrayBuffer) || data.byteLength < headerSize) return;
     const view = new DataView(data);
@@ -2257,6 +2378,8 @@ function disconnect() {
   videoConnectAttempt = null;
   audioConnectAttempt = null;
   releaseControl();
+  resetDisplays();
+  presentedGeneration = 0;
   resizeObserver?.disconnect();
   resizeObserver = null;
   window.removeEventListener("resize", scheduleResize);
@@ -2357,10 +2480,12 @@ return {
   enableAudio,
   getAudioMuted: () => audioMuted,
   getRemoteClipboard: () => remoteClipboard,
+  getDisplayState: () => displayState,
   pasteText,
   remoteDisplayPolicyChanged,
   requestControl,
   releaseControl,
+  selectDisplay,
   sendClipboardText,
   setLatencyTarget,
   setMuted,
@@ -2529,6 +2654,13 @@ export class WaymoteSession {
         return this.#runtime.sendClipboardText(String(text));
       },
       get latestRemoteText() { return session.#runtime.getRemoteClipboard(); },
+    });
+    this.displays = Object.freeze({
+      select: (id) => {
+        this.#assertActive();
+        return this.#runtime.selectDisplay(String(id));
+      },
+      get state() { return session.#runtime.getDisplayState(); },
     });
     this.remoteDisplay = Object.freeze({
       setPolicy: (policy) => this.#setRemoteDisplayPolicy(policy),

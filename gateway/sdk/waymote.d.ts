@@ -125,12 +125,41 @@ export interface QualityEvent {
   readonly scalePercent: number;
 }
 
+export interface HostDisplay {
+  readonly id: string;
+  readonly name: string;
+  readonly width: number;
+  readonly height: number;
+  readonly isMain: boolean;
+}
+
+export interface DisplayState {
+  readonly displays: readonly HostDisplay[];
+  readonly selectedID: string | null;
+  readonly generation: number;
+  /** True until a frame of the selected display has been drawn on the surface. */
+  readonly switching: boolean;
+  readonly error: string | null;
+}
+
+export interface DisplayController {
+  /** Null until the server advertises display selection with display-state. */
+  readonly state: DisplayState | null;
+  /**
+   * Selects a display, acquiring input control first when needed. Returns false
+   * when selection is unsupported, the display is unknown, or a switch is in
+   * progress, and true without a request when the display is already selected.
+   */
+  select(id: string): boolean;
+}
+
 export interface WaymoteEventMap {
   readonly state: WaymoteSessionState;
   readonly stats: WaymoteStats;
   readonly clipboard: ClipboardEvent;
   readonly resize: ResizeEvent;
   readonly quality: QualityEvent;
+  readonly displays: DisplayState | null;
   readonly error: Error;
 }
 
@@ -219,6 +248,7 @@ export declare class WaymoteSession {
   readonly audio: AudioController;
   readonly input: InputController;
   readonly clipboard: ClipboardController;
+  readonly displays: DisplayController;
   readonly remoteDisplay: RemoteDisplayController;
   attachSurface(options: SurfaceOptions): SurfaceHandle;
   connect(): void;

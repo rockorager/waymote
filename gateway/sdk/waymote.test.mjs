@@ -1149,6 +1149,7 @@ async function controlledSession(t, { platform = "Linux x86_64", ...options } = 
   canvas.getContext = () => ({ drawImage() {} });
   canvas.focus = () => {};
   canvas.setPointerCapture = () => {};
+  canvas.hasPointerCapture = () => false;
   const textInput = new FakeTarget();
   textInput.value = "";
   textInput.focus = () => {};
@@ -1539,4 +1540,219 @@ test("iOS keyboard symbols are typed as text without resolved keysyms", async (t
   control.sent.length = 0;
   softKey("Digit1", "!", false);
   assert.deepEqual(sent(), [[2, 1], [2, 0]]);
+});
+
+const hostDisplays = [
+  { id: "7", name: "Built-in Retina Display", width: 3024, height: 1964, isMain: true },
+  { id: "42", name: "Portrait", width: 1200, height: 2000, isMain: false },
+];
+
+async function displaySession(t, options) {
+  const context = await controlledSession(t, options);
+  const decoders = [];
+  const closedFrames = [];
+  globalThis.EncodedVideoChunk = class {
+    constructor(init) { Object.assign(this, init); }
+  };
+  globalThis.VideoDecoder = class {
+    static async isConfigSupported() { return { supported: true }; }
+    state = "unconfigured";
+    decodeQueueSize = 0;
+    constructor({ output }) {
+      this.output = output;
+      decoders.push(this);
+    }
+    configure() { this.state = "configured"; }
+    reset() { this.state = "unconfigured"; }
+    close() { this.state = "closed"; }
+    decode(chunk) {
+      const size = new DataView(chunk.data.buffer, chunk.data.byteOffset);
+      this.output(frame(chunk.timestamp, size.getUint16(0, true), size.getUint16(2, true)));
+    }
+  };
+  const frame = (timestamp, displayWidth, displayHeight) => ({
+    timestamp, displayWidth, displayHeight,
+    close() { closedFrames.push(timestamp); },
+  });
+  const video = context.sockets.get("/stream");
+  video.dispatch("message", {
+    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
+  });
+  await settleVideoSetup();
+  const states = [];
+  context.session.on("displays", (state) => states.push(state));
+  return {
+    ...context, decoders, closedFrames, frame, states,
+    displayState(selectedID, generation, switching = false, extra = {}) {
+      context.receive({
+        type: "display-state", displays: hostDisplays, selectedID, generation, switching, ...extra,
+      });
+    },
+    queueFrame(generation, width, height) {
+      const buffer = new ArrayBuffer(44);
+      const header = new DataView(buffer);
+      header.setUint8(0, 2);
+      header.setUint8(1, 1);
+      header.setUint8(2, 1);
+      header.setBigUint64(12, BigInt(generation * 1000), true);
+      header.setUint32(20, generation, true);
+      header.setUint16(40, width, true);
+      header.setUint16(42, height, true);
+      video.dispatch("message", { data: buffer });
+    },
+    paint() {
+      for (const callback of context.animationFrames.splice(0)) callback(0);
+    },
+  };
+}
+
+test("display selection resumes input only after the new display is drawn", async (t) => {
+  const {
+    session, control, canvas, keyEvent, pointerEvent, beforeInput, paste, messages, states,
+    displayState, queueFrame, paint,
+  } = await displaySession(t);
+  displayState("7", 3);
+  assert.equal(session.displays.state.switching, true);
+  queueFrame(3, 1600, 900);
+  paint();
+  assert.equal(session.displays.state.switching, false);
+  keyEvent("keydown", "KeyA", { key: "a" });
+  control.sent.length = 0;
+
+  assert.equal(session.displays.select("42"), true);
+  assert.deepEqual(messages(), ["release-all", { type: "display-select", id: "42" }]);
+  displayState("42", 5);
+  control.sent.length = 0;
+  // A frame of the old generation does not end the switch.
+  queueFrame(3, 1600, 900);
+  paint();
+  assert.equal(session.displays.select("7"), false);
+  session.input.setStickyModifiers([125]);
+  beforeInput("c");
+  assert.deepEqual(session.state.input.stickyModifiers, [125]);
+  beforeInput("x");
+  keyEvent("keydown", "KeyB", { key: "b" });
+  pointerEvent("pointerdown", 640, 360);
+  assert.equal(session.input.tapKey(15), false);
+  assert.equal(session.input.pasteText("while switching"), false);
+  assert.equal(session.clipboard.sendText("while switching"), false);
+  paste("while switching");
+  queueFrame(5, 600, 1000);
+  assert.equal(session.displays.state.switching, true);
+  assert.deepEqual(messages(), []);
+
+  paint();
+  assert.equal(session.displays.state.switching, false);
+  assert.deepEqual(session.state.input.stickyModifiers, []);
+  assert.deepEqual(messages(), [{ type: "display-presented", generation: 5 }]);
+  assert.deepEqual(states.map(({ selectedID, switching }) => [selectedID, switching]), [
+    ["7", true], ["7", false], ["7", true], ["42", true], ["42", false],
+  ]);
+  // Keys and buttons pressed during the switch are not held afterwards, and
+  // the pointer maps into the portrait display's letterboxed area.
+  control.sent.length = 0;
+  keyEvent("keyup", "KeyB", { key: "b" });
+  pointerEvent("pointerup", 640, 360);
+  canvas.bounds = { left: 100, top: 20, width: 800, height: 600 };
+  pointerEvent("pointerdown", 410, 470);
+  assert.deepEqual(messages(), [["motion", 16384, 49151], ["button", 0x110, 1]]);
+});
+
+test("display selection stays inert until the server advertises it", async (t) => {
+  const { session, control, receive, messages, states, displayState, queueFrame, paint } =
+    await displaySession(t);
+  assert.equal(session.displays.state, null);
+  assert.equal(session.displays.select("42"), false);
+  queueFrame(3, 1600, 900);
+  paint();
+  displayState("missing", 3);
+  displayState("7", 3, false, { displays: [{ id: "7", name: "No size", isMain: true }] });
+  receive({ type: "display-state", displays: hostDisplays, selectedID: "7", generation: -1, switching: false });
+  assert.equal(session.displays.state, null);
+  assert.deepEqual(messages(), []);
+  assert.deepEqual(states, []);
+
+  displayState("7", 3, false, { error: "Display 42 disconnected" });
+  assert.deepEqual(session.displays.state, {
+    displays: hostDisplays, selectedID: "7", generation: 3, switching: false,
+    error: "Display 42 disconnected",
+  });
+  control.sent.length = 0;
+  assert.equal(session.displays.select("missing"), false);
+  assert.equal(session.displays.select("7"), true);
+  assert.deepEqual(messages(), []);
+  control.dispatch("close", { code: 1006 });
+  assert.equal(session.displays.state, null);
+  assert.equal(session.displays.select("42"), false);
+  // The display was already drawn, so it is acknowledged at once.
+  assert.deepEqual(states.map((state) => state && [state.selectedID, state.switching]), [
+    ["7", true], ["7", false], null,
+  ]);
+});
+
+test("display selection reacquires control and yields to another viewer", async (t) => {
+  const { session, control, receive, messages, displayState, queueFrame, paint } =
+    await displaySession(t);
+  queueFrame(3, 1600, 900);
+  paint();
+  displayState("7", 3);
+  session.input.release();
+  control.sent.length = 0;
+  assert.equal(session.displays.select("42"), true);
+  assert.deepEqual(messages(), ["acquire"]);
+  receive({ type: "control-state", state: "busy" });
+  assert.equal(session.displays.state.switching, false);
+  assert.equal(session.displays.state.error, "Another viewer is controlling the desktop.");
+  receive({ type: "control-state", state: "active" });
+  assert.deepEqual(messages(), ["acquire"]);
+
+  session.input.release();
+  control.sent.length = 0;
+  assert.equal(session.displays.select("42"), true);
+  assert.equal(session.displays.state.error, null);
+  receive({ type: "control-state", state: "active" });
+  assert.deepEqual(messages(), [
+    "acquire", "release-all", { type: "display-select", id: "42" },
+  ]);
+});
+
+test("a host display change may arrive on video before its display-state", async (t) => {
+  const {
+    session, canvas, control, messages, closedFrames, displayState, queueFrame, paint,
+  } = await displaySession(t);
+  displayState("7", 3);
+  queueFrame(3, 1600, 900);
+  paint();
+  displayState("7", 3, true);
+  control.sent.length = 0;
+  assert.equal(session.displays.select("42"), false);
+  queueFrame(4, 1600, 900);
+  closedFrames.length = 0;
+  // The generation change drops frames of the old generation before drawing.
+  queueFrame(6, 600, 1000);
+  assert.deepEqual(closedFrames, [4000]);
+  paint();
+  assert.equal(session.displays.state.switching, true);
+  assert.deepEqual(messages(), []);
+  displayState("42", 5);
+  assert.deepEqual([session.displays.state.selectedID, session.displays.state.switching], ["42", false]);
+  assert.deepEqual([canvas.width, canvas.height], [600, 1000]);
+  assert.deepEqual(messages(), ["release-all", { type: "display-presented", generation: 6 }]);
+});
+
+test("frames from a replaced video decoder are never drawn", async (t) => {
+  const { session, canvas, sockets, decoders, closedFrames, frame, displayState, paint } =
+    await displaySession(t);
+  sockets.get("/stream").dispatch("message", {
+    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
+  });
+  await settleVideoSetup();
+  assert.equal(decoders.length, 2);
+  displayState("7", 0);
+  decoders[0].output(frame(9000, 640, 480));
+  paint();
+  assert.deepEqual(closedFrames, [9000]);
+  assert.deepEqual([canvas.width, canvas.height], [1280, 720]);
+  session.disconnect();
+  assert.equal(session.displays.state, null);
 });
