@@ -38,6 +38,13 @@ npx --yes --package typescript@5.7.3 tsc \
 npm pack --dry-run ./gateway/sdk
 ```
 
+For changes under `h264/`, also check the encoder bit for bit against FFmpeg's
+H.264 decoder (needs `ffmpeg` on `PATH`; not run in CI):
+
+```sh
+zig build h264-check -Doptimize=ReleaseSafe
+```
+
 Use the narrowest relevant subset while iterating, then run the complete checks
 before publishing a release.
 

@@ -66,8 +66,27 @@ pub fn build(b: *std.Build) void {
     go_build.addArg(".");
     b.getInstallStep().dependOn(&b.addInstallBinFile(gateway, "waymote-gateway").step);
 
+    const h264_check = b.addExecutable(.{
+        .name = "h264-check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("h264/check.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_h264_check = b.addRunArtifact(h264_check);
+    _ = run_h264_check.addOutputDirectoryArg("h264-check");
+    run_h264_check.has_side_effects = true;
+    const h264_check_step = b.step("h264-check", "Check the H.264 encoder bit-exactly against FFmpeg's decoder");
+    h264_check_step.dependOn(&run_h264_check.step);
+
     const test_step = b.step("test", "Run native and gateway tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = stream_module })).step);
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("h264/Encoder.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) })).step);
     const go_test = b.addSystemCommand(&.{ "go", "test", "./..." });
     go_test.setCwd(b.path("gateway"));
     test_step.dependOn(&go_test.step);
