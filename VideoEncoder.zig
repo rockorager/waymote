@@ -1,14 +1,17 @@
 //! Runs the software video encoder without blocking Wayland capture or input.
 //!
-//! Capture owns a fixed three-slot pool: one frame may be inside FFmpeg, one
-//! may wait, and the third keeps allocation independent of the worker. A new
+//! Capture owns a fixed three-slot pool: one frame may be encoding, one may
+//! wait, and the third keeps allocation independent of the worker. A new
 //! capture replaces the waiting frame rather than building latency. The worker
-//! asks the main loop to publish correlation metadata only after a complete raw
-//! frame has reached FFmpeg's pipe; the RTP receiver can wait for that metadata.
+//! converts each frame to I420, encodes it with Waymote's H.264 encoder, asks
+//! the main loop to publish correlation metadata, and only then sends the
+//! access unit, so the RTP receiver always finds metadata for a complete frame.
 
 const VideoEncoder = @This();
 
 const std = @import("std");
+const ColorConvert = @import("ColorConvert");
+const H264Encoder = @import("h264");
 
 const linux = std.os.linux;
 const log = std.log.scoped(.video_encoder);
@@ -16,10 +19,33 @@ const slot_count = 3;
 const initial_restart_delay_ms = 1000;
 const maximum_restart_delay_ms = 30_000;
 const stable_run_ms = 30_000;
+/// The gateway's bootstrap buffer holds at most 240 frames of a GOP.
+const max_gop_length = 240;
+/// How long captures must pause before the encoder re-sends the last picture
+/// to sharpen what rate control left coarse.
+const refine_idle_ns = 100 * std.time.ns_per_ms;
+const rtp_payload_type = 96;
+const rtp_header_size = 12;
+/// Matches the `pkt_size=60000` FFmpeg used; loopback UDP carries it whole.
+const rtp_packet_size = 60_000;
+const rtp_clock_rate = 90_000;
+
+/// The finest QP rate control uses; it codes coarser only to stay within the
+/// bitrate.
+const finest_qp = 24;
 
 pub const Options = struct {
-    ffmpeg_path: []const u8,
     rtp_port: ?u16,
+};
+
+/// A half-open range of captured rows.
+pub const Rows = struct {
+    first: u32,
+    end: u32,
+
+    fn merge(self: Rows, other: Rows) Rows {
+        return .{ .first = @min(self.first, other.first), .end = @max(self.end, other.end) };
+    }
 };
 
 pub const Metadata = struct {
@@ -33,6 +59,8 @@ pub const Metadata = struct {
     input_sequence: u32,
     fps: u32,
     bitrate_kbps: u32,
+    /// Rows that changed since the previous capture.
+    damage: Rows,
 
     fn config(self: Metadata) Config {
         return .{
@@ -89,47 +117,119 @@ const PendingFrame = struct {
     metadata: Metadata,
 };
 
-const Process = struct {
-    child: std.process.Child,
-    pidfd: std.posix.fd_t,
+/// One encoder session. A configuration change replaces the whole session and
+/// its RTP SSRC, which tells the gateway the media timeline restarted.
+///
+/// Unchanged macroblocks are skipped, changed ones are motion-compensated
+/// (including scrolls) or intra coded, and macroblocks that rate control left
+/// coarse are refined once the screen stops changing.
+const Encoder = struct {
+    h264: H264Encoder,
+    planes: []u8,
     config: Config,
     generation: u32,
     started_at_ms: u64,
+    ssrc: u32,
+    rtp_sequence: u16,
+    frame_index: u64 = 0,
+    /// False until the I420 planes hold a whole frame; later frames convert
+    /// only their damaged rows.
+    planes_complete: bool = false,
 
-    fn kill(self: *Process, io: std.Io) void {
-        const result = linux.pidfd_send_signal(self.pidfd, .KILL, null, 0);
-        switch (linux.errno(result)) {
-            .SUCCESS, .SRCH => self.reap(io, false),
-            else => |err| {
-                // A valid pidfd for our own child should always accept SIGKILL.
-                // Keep Child.kill as an exceptional fallback rather than the
-                // normal path: it sends SIGTERM and can wait indefinitely for
-                // an encoder blocked in a pipe read.
-                log.err("could not force-stop video encoder: {t}", .{err});
-                self.child.kill(io);
-                _ = linux.close(self.pidfd);
-            },
-        }
-    }
-
-    fn reap(self: *Process, io: std.Io, report_termination: bool) void {
-        const term: ?std.process.Child.Term = self.child.wait(io) catch |err| result: {
-            log.warn("could not reap video encoder: {t}", .{err});
-            self.child.kill(io);
-            break :result null;
+    fn open(
+        allocator: std.mem.Allocator,
+        config: Config,
+        generation: u32,
+        ssrc: u32,
+    ) !Encoder {
+        const width: usize = config.encoded_width;
+        const height: usize = config.encoded_height;
+        const planes = try allocator.alloc(u8, width * height * 3 / 2);
+        errdefer allocator.free(planes);
+        const h264 = try H264Encoder.init(allocator, .{
+            .width = config.encoded_width,
+            .height = config.encoded_height,
+            .qp = finest_qp,
+            .bitrate_kbps = config.bitrate_kbps,
+            .fps = config.fps,
+            .keyframe_interval = config.fps,
+            .max_gop_length = max_gop_length,
+        });
+        log.info("capturing {}x{} at {d} FPS and {d} kbps", .{
+            config.raw_width,
+            config.raw_height,
+            config.fps,
+            config.bitrate_kbps,
+        });
+        return .{
+            .h264 = h264,
+            .planes = planes,
+            .config = config,
+            .generation = generation,
+            .started_at_ms = monotonicMilliseconds(),
+            .ssrc = ssrc,
+            .rtp_sequence = @truncate(ssrc *% 2654435761),
         };
-        _ = linux.close(self.pidfd);
-        if (report_termination) {
-            if (term) |value| log.warn("video encoder stopped: {any}", .{value});
-        }
     }
 
-    fn stop(self: *Process, io: std.Io) void {
-        if (processExited(self)) {
-            self.reap(io, true);
-        } else {
-            self.kill(io);
-        }
+    fn close(self: *Encoder, allocator: std.mem.Allocator) void {
+        self.h264.deinit();
+        allocator.free(self.planes);
+    }
+
+    /// Encodes one captured frame and returns its Annex-B access unit, which
+    /// stays valid until the next call.
+    fn encode(self: *Encoder, data: []const u8, damage: Rows) ![]const u8 {
+        const width: usize = self.config.encoded_width;
+        const height: usize = self.config.encoded_height;
+        const raw_width: usize = self.config.raw_width;
+        const raw_height: usize = self.config.raw_height;
+        if (data.len < raw_width * raw_height * 4) return error.ShortVideoFrame;
+        const rows: Rows = if (self.planes_complete and width == raw_width and height == raw_height) .{
+            .first = damage.first & ~@as(u32, 1),
+            .end = @min(@as(u32, @intCast(height)), (damage.end + 1) & ~@as(u32, 1)),
+        } else .{ .first = 0, .end = @intCast(height) };
+        ColorConvert.convert(
+            .{ .data = data, .width = raw_width, .height = raw_height, .stride = raw_width * 4 },
+            width,
+            height,
+            .{
+                .y = self.planes[0 .. width * height],
+                .u = self.planes[width * height ..][0 .. width * height / 4],
+                .v = self.planes[width * height * 5 / 4 ..][0 .. width * height / 4],
+                .y_stride = width,
+                .chroma_stride = width / 2,
+            },
+            rows.first,
+            rows.end,
+        );
+        self.planes_complete = true;
+        return self.encodePlanes(rows);
+    }
+
+    /// Encodes the converted planes, of which only `rows` changed.
+    fn encodePlanes(self: *Encoder, rows: Rows) ![]const u8 {
+        const width: usize = self.config.encoded_width;
+        const height: usize = self.config.encoded_height;
+        return self.h264.encode(.{
+            .y = self.planes[0 .. width * height],
+            .u = self.planes[width * height ..][0 .. width * height / 4],
+            .v = self.planes[width * height * 5 / 4 ..][0 .. width * height / 4],
+            .y_stride = width,
+            .chroma_stride = width / 2,
+        }, .{ .first = rows.first, .end = rows.end }, false);
+    }
+
+    /// Re-codes macroblocks that rate control left coarse at a finer QP while
+    /// nothing changes on screen. Null means there is nothing to send this
+    /// interval.
+    fn refine(self: *Encoder) !?[]const u8 {
+        std.debug.assert(self.planes_complete);
+        return self.h264.refine();
+    }
+
+    fn rtpTimestamp(self: *const Encoder) u32 {
+        return @truncate(self.frame_index * rtp_clock_rate / self.config.fps);
     }
 };
 
@@ -201,7 +301,10 @@ pub fn submit(self: *VideoEncoder, data: []const u8, metadata: Metadata) !Submit
         slot.data = try self.allocator.alloc(u8, data.len);
     }
     @memcpy(slot.data.?, data);
+    // A replaced frame is never encoded, so its changes carry forward.
+    const damage = if (replacing) slot.metadata.damage.merge(metadata.damage) else metadata.damage;
     slot.metadata = metadata;
+    slot.metadata.damage = damage;
     slot.state = .pending;
     self.pending_slot = slot_index;
     try signalEvent(self.work_event_fd);
@@ -233,51 +336,81 @@ fn run(self: *VideoEncoder) void {
 }
 
 fn runInner(self: *VideoEncoder) !void {
-    var process: ?Process = null;
-    defer if (process) |*value| value.stop(self.io);
+    const socket = if (self.options.rtp_port) |port| try openRtpSocket(port) else null;
+    defer if (socket) |fd| {
+        _ = linux.close(fd);
+    };
+    var encoder: ?Encoder = null;
+    defer if (encoder) |*value| value.close(self.allocator);
     var ever_started = false;
     var last_generation: u32 = 0;
     var reset_prepared = false;
     var next_ssrc: u32 = 1;
     var restart_delay_ms: u32 = initial_restart_delay_ms;
     var retry_at_ms: u64 = 0;
+    var next_encode_nanos: u64 = 0;
+    var last_metadata: ?Metadata = null;
+    var last_capture_nanos: u64 = 0;
 
     while (!self.isStopping()) {
-        if (process) |*active| {
-            if (processExited(active)) {
-                active.reap(self.io, true);
-                process = null;
-                reset_prepared = false;
-                retry_at_ms = monotonicMilliseconds() + restart_delay_ms;
-                restart_delay_ms = @min(restart_delay_ms * 2, maximum_restart_delay_ms);
-                continue;
-            }
-        }
-
         const now = monotonicMilliseconds();
-        if (process == null and retry_at_ms > now) {
-            _ = try self.waitForEvents(null, @intCast(@min(retry_at_ms - now, std.math.maxInt(i32))));
+        if (encoder == null and retry_at_ms > now) {
+            try self.waitForEvents(@intCast(@min(retry_at_ms - now, std.math.maxInt(i32))));
+            continue;
+        }
+        // Encode no faster than the configured frame rate, as FFmpeg's `-re`
+        // did. Captures that arrive meanwhile replace the waiting frame.
+        const now_nanos = monotonicNanoseconds();
+        if (encoder != null and now_nanos < next_encode_nanos) {
+            const wait_ms = (next_encode_nanos - now_nanos + std.time.ns_per_ms - 1) /
+                std.time.ns_per_ms;
+            try self.waitForEvents(@intCast(wait_ms));
             continue;
         }
 
         const frame = self.takePending() orelse {
-            const event = try self.waitForEvents(if (process) |*active| active else null, -1);
-            if (event == .process_exited) {
-                process.?.reap(self.io, true);
-                process = null;
+            // Without a capture to encode, an idle screen spends spare bitrate
+            // sharpening the last picture, paced like captures.
+            const active = if (encoder) |*value| value else null;
+            if (active == null or last_metadata == null) {
+                try self.waitForEvents(-1);
+                continue;
+            }
+            if (!active.?.h264.refinementPending()) {
+                try self.waitForEvents(-1);
+                continue;
+            }
+            const refine_at = last_capture_nanos + refine_idle_ns;
+            if (now_nanos < refine_at) {
+                try self.waitForEvents(@intCast((refine_at - now_nanos + std.time.ns_per_ms - 1) / std.time.ns_per_ms));
+                continue;
+            }
+            const refined = active.?.refine() catch |err| {
+                log.warn("idle video encode failed: {t}; retrying in {d} ms", .{ err, restart_delay_ms });
+                active.?.close(self.allocator);
+                encoder = null;
                 reset_prepared = false;
                 retry_at_ms = monotonicMilliseconds() + restart_delay_ms;
                 restart_delay_ms = @min(restart_delay_ms * 2, maximum_restart_delay_ms);
-            }
+                continue;
+            };
+            next_encode_nanos = @max(next_encode_nanos + std.time.ns_per_s / active.?.config.fps, now_nanos);
+            // Without room in the bitrate this interval, there is nothing to send.
+            const access_unit = refined orelse continue;
+            var metadata = last_metadata.?;
+            metadata.capture_nanos = monotonicNanoseconds();
+            metadata.damage = .{ .first = 0, .end = 0 };
+            const completion = (try self.deliver(socket, active.?, access_unit, metadata)) orelse break;
+            last_generation = completion.generation;
             continue;
         };
         defer self.release(frame.slot_index);
 
         var metadata = frame.metadata;
         const config = metadata.config();
-        const replacing_process = ever_started and
-            (process == null or !std.meta.eql(process.?.config, config));
-        if (replacing_process and !reset_prepared) {
+        const replacing_encoder = ever_started and
+            (encoder == null or !std.meta.eql(encoder.?.config, config));
+        if (replacing_encoder and !reset_prepared) {
             const completion = self.postNotification(.{ .restart = .{
                 .generation = metadata.generation,
                 .increment_generation = metadata.generation == last_generation,
@@ -287,12 +420,12 @@ fn runInner(self: *VideoEncoder) !void {
             reset_prepared = true;
         }
 
-        if (process != null and !std.meta.eql(process.?.config, config)) {
-            process.?.stop(self.io);
-            process = null;
+        if (encoder != null and !std.meta.eql(encoder.?.config, config)) {
+            encoder.?.close(self.allocator);
+            encoder = null;
         }
-        if (process == null) {
-            process = self.startProcess(config, metadata.generation, next_ssrc) catch |err| {
+        if (encoder == null) {
+            encoder = Encoder.open(self.allocator, config, metadata.generation, next_ssrc) catch |err| {
                 log.warn("video encoder start failed: {t}; retrying in {d} ms", .{
                     err,
                     restart_delay_ms,
@@ -306,30 +439,50 @@ fn runInner(self: *VideoEncoder) !void {
             ever_started = true;
             retry_at_ms = 0;
         }
+        const active = &encoder.?;
         // Captures queued while a restart handshake was in flight still carry
-        // the previous generation. The process owns the media generation.
-        metadata.generation = process.?.generation;
+        // the previous generation. The encoder owns the media generation.
+        metadata.generation = active.generation;
 
-        self.writeFrame(&process.?, frame.data) catch |err| {
-            log.warn("video encoder write failed: {t}; retrying in {d} ms", .{
-                err,
-                restart_delay_ms,
-            });
-            process.?.stop(self.io);
-            process = null;
+        const access_unit = active.encode(frame.data, metadata.damage) catch |err| {
+            log.warn("video encode failed: {t}; retrying in {d} ms", .{ err, restart_delay_ms });
+            active.close(self.allocator);
+            encoder = null;
             reset_prepared = false;
             retry_at_ms = monotonicMilliseconds() + restart_delay_ms;
             restart_delay_ms = @min(restart_delay_ms * 2, maximum_restart_delay_ms);
             continue;
         };
+        next_encode_nanos = @max(next_encode_nanos + std.time.ns_per_s / config.fps, now_nanos);
+        last_metadata = metadata;
+        last_capture_nanos = now_nanos;
 
-        const completion = self.postNotification(.{ .metadata = metadata }) orelse break;
+        const completion = (try self.deliver(socket, active, access_unit, metadata)) orelse break;
         last_generation = completion.generation;
         reset_prepared = false;
-        if (monotonicMilliseconds() -| process.?.started_at_ms >= stable_run_ms) {
+        if (monotonicMilliseconds() -| active.started_at_ms >= stable_run_ms) {
             restart_delay_ms = initial_restart_delay_ms;
         }
     }
+}
+
+/// Reports a frame's metadata to the main thread, then sends its access unit.
+/// Returns null when the encoder is stopping.
+fn deliver(
+    self: *VideoEncoder,
+    socket: ?std.posix.fd_t,
+    active: *Encoder,
+    access_unit: []const u8,
+    metadata: Metadata,
+) !?Completion {
+    const completion = self.postNotification(.{ .metadata = metadata }) orelse return null;
+    if (socket) |fd| {
+        sendRtp(fd, access_unit, active.ssrc, active.rtpTimestamp(), &active.rtp_sequence);
+    } else {
+        try writeAll(1, access_unit);
+    }
+    active.frame_index += 1;
+    return completion;
 }
 
 fn takePending(self: *VideoEncoder) ?PendingFrame {
@@ -377,178 +530,138 @@ fn isStopping(self: *VideoEncoder) bool {
     return self.stopping;
 }
 
-const WorkerEvent = enum { wake, process_exited, timeout };
-
-fn waitForEvents(self: *VideoEncoder, process: ?*const Process, timeout: i32) !WorkerEvent {
+fn waitForEvents(self: *VideoEncoder, timeout: i32) !void {
     var poll_fds = [_]std.posix.pollfd{
         .{ .fd = self.work_event_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = if (process) |active| active.pidfd else -1, .events = std.posix.POLL.IN, .revents = 0 },
     };
-    const count = try std.posix.poll(&poll_fds, timeout);
+    _ = try std.posix.poll(&poll_fds, timeout);
     if (poll_fds[0].revents != 0) try drainEvent(self.work_event_fd);
-    if (poll_fds[1].revents &
-        (std.posix.POLL.IN | std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0)
-    {
-        return .process_exited;
-    }
-    return if (count == 0) .timeout else .wake;
 }
 
-fn startProcess(self: *VideoEncoder, config: Config, generation: u32, ssrc: u32) !Process {
-    var size_buffer: [32]u8 = undefined;
-    var output_size_buffer: [32]u8 = undefined;
-    var rate_buffer: [16]u8 = undefined;
-    var bitrate_buffer: [24]u8 = undefined;
-    var peak_bitrate_buffer: [24]u8 = undefined;
-    var keyframe_buffer: [16]u8 = undefined;
-    var ssrc_buffer: [16]u8 = undefined;
-    var rtp_url_buffer: [64]u8 = undefined;
-    const size = try std.fmt.bufPrint(&size_buffer, "{d}x{d}", .{
-        config.raw_width,
-        config.raw_height,
-    });
-    const output_size = try std.fmt.bufPrint(&output_size_buffer, "scale={d}:{d}", .{
-        config.encoded_width,
-        config.encoded_height,
-    });
-    const rate = try std.fmt.bufPrint(&rate_buffer, "{d}", .{config.fps});
-    const bitrate = try std.fmt.bufPrint(&bitrate_buffer, "{d}k", .{config.bitrate_kbps});
-    const peak_bitrate = try std.fmt.bufPrint(&peak_bitrate_buffer, "{d}k", .{
-        config.bitrate_kbps * 2,
-    });
-    const keyframe_interval = try std.fmt.bufPrint(&keyframe_buffer, "{d}", .{config.fps});
-    const ssrc_text = try std.fmt.bufPrint(&ssrc_buffer, "{d}", .{ssrc});
-    const common_argv = [_][]const u8{
-        self.options.ffmpeg_path,
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-nostdin",
-        "-f",
-        "rawvideo",
-        "-pixel_format",
-        "bgra",
-        "-video_size",
-        size,
-        "-framerate",
-        rate,
-        "-re",
-        "-i",
-        "pipe:0",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-tune",
-        "zerolatency",
-        "-profile:v",
-        "baseline",
-        "-level:v",
-        "5.2",
-        "-pix_fmt",
-        "yuv420p",
-        "-b:v",
-        bitrate,
-        "-maxrate",
-        peak_bitrate,
-        "-bufsize",
-        peak_bitrate,
-        "-g",
-        keyframe_interval,
-        "-keyint_min",
-        keyframe_interval,
-        "-sc_threshold",
-        "0",
-        "-bf",
-        "0",
-        "-x264-params",
-        "aud=1:repeat-headers=1",
+fn openRtpSocket(port: u16) !std.posix.fd_t {
+    const result = linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0);
+    const fd: std.posix.fd_t = switch (linux.errno(result)) {
+        .SUCCESS => @intCast(result),
+        else => return error.RtpSocketFailed,
     };
-    var argv: [common_argv.len + 14][]const u8 = undefined;
-    @memcpy(argv[0..common_argv.len], &common_argv);
-    var argument_count = common_argv.len;
-    argv[argument_count] = "-vf";
-    argv[argument_count + 1] = output_size;
-    argument_count += 2;
-    if (self.options.rtp_port) |port| {
-        const url = try std.fmt.bufPrint(&rtp_url_buffer, "rtp://127.0.0.1:{d}?pkt_size=60000", .{port});
-        const output_argv = [_][]const u8{
-            "-payload_type",
-            "96",
-            "-ssrc",
-            ssrc_text,
-            "-rtpflags",
-            "skip_rtcp",
-            "-f",
-            "rtp",
-            url,
-        };
-        @memcpy(argv[argument_count..][0..output_argv.len], &output_argv);
-        argument_count += output_argv.len;
-    } else {
-        const output_argv = [_][]const u8{ "-f", "h264", "pipe:1" };
-        @memcpy(argv[argument_count..][0..output_argv.len], &output_argv);
-        argument_count += output_argv.len;
-    }
-    var child = try std.process.spawn(self.io, .{
-        .argv = argv[0..argument_count],
-        .stdin = .pipe,
-        .stdout = if (self.options.rtp_port == null) .inherit else .ignore,
-        .stderr = .inherit,
-    });
-    errdefer child.kill(self.io);
-    try setNonblocking(child.stdin.?.handle);
-    const pidfd = try openPidfd(child.id.?);
-    log.info("capturing {}x{} at {d} FPS and {d} kbps", .{
-        config.raw_width,
-        config.raw_height,
-        config.fps,
-        config.bitrate_kbps,
-    });
-    return .{
-        .child = child,
-        .pidfd = pidfd,
-        .config = config,
-        .generation = generation,
-        .started_at_ms = monotonicMilliseconds(),
+    errdefer _ = linux.close(fd);
+    const address: linux.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, port),
+        .addr = std.mem.nativeToBig(u32, 0x7f00_0001),
     };
+    const connect_result = linux.connect(fd, @ptrCast(&address), @sizeOf(linux.sockaddr.in));
+    if (linux.errno(connect_result) != .SUCCESS) return error.RtpConnectFailed;
+    return fd;
 }
 
-fn writeFrame(self: *VideoEncoder, process: *Process, data: []const u8) !void {
-    const fd = process.child.stdin.?.handle;
+/// Splits an Annex-B byte stream into NAL units without their start codes.
+const NalIterator = struct {
+    data: []const u8,
+    index: usize = 0,
+
+    fn next(self: *NalIterator) ?[]const u8 {
+        const nal_start = self.skipStartCode() orelse return null;
+        var end = nal_start;
+        while (end + 3 <= self.data.len) : (end += 1) {
+            if (self.data[end] == 0 and self.data[end + 1] == 0 and
+                (self.data[end + 2] == 1 or
+                    (self.data[end + 2] == 0 and end + 3 < self.data.len and self.data[end + 3] == 1)))
+            {
+                self.index = end;
+                return self.data[nal_start..end];
+            }
+        }
+        self.index = self.data.len;
+        return if (nal_start < self.data.len) self.data[nal_start..] else null;
+    }
+
+    fn skipStartCode(self: *NalIterator) ?usize {
+        var index = self.index;
+        while (index + 3 <= self.data.len) : (index += 1) {
+            if (self.data[index] == 0 and self.data[index + 1] == 0) {
+                if (self.data[index + 2] == 1) return index + 3;
+                if (self.data[index + 2] == 0 and index + 3 < self.data.len and
+                    self.data[index + 3] == 1) return index + 4;
+            }
+        }
+        return null;
+    }
+};
+
+/// Packetizes one access unit as RFC 6184 single NAL unit and FU-A packets,
+/// marking its last packet. Loopback delivery failures drop the frame; the
+/// gateway then reports it lacks a keyframe, and streamd sends one.
+fn sendRtp(
+    fd: std.posix.fd_t,
+    access_unit: []const u8,
+    ssrc: u32,
+    timestamp: u32,
+    sequence: *u16,
+) void {
+    var packet: [rtp_packet_size]u8 = undefined;
+    const maximum_payload = rtp_packet_size - rtp_header_size;
+    var nals: NalIterator = .{ .data = access_unit };
+    var current = nals.next();
+    while (current) |nal| {
+        const following = nals.next();
+        const last_nal = following == null;
+        if (nal.len <= maximum_payload) {
+            writeRtpHeader(&packet, last_nal, sequence, timestamp, ssrc);
+            @memcpy(packet[rtp_header_size..][0..nal.len], nal);
+            sendPacket(fd, packet[0 .. rtp_header_size + nal.len]);
+        } else {
+            const indicator = (nal[0] & 0xe0) | 28;
+            const nal_type = nal[0] & 0x1f;
+            var offset: usize = 1;
+            while (offset < nal.len) {
+                const chunk = @min(nal.len - offset, maximum_payload - 2);
+                const first = offset == 1;
+                const last = offset + chunk == nal.len;
+                writeRtpHeader(&packet, last_nal and last, sequence, timestamp, ssrc);
+                packet[rtp_header_size] = indicator;
+                packet[rtp_header_size + 1] = nal_type |
+                    (if (first) @as(u8, 0x80) else 0) | (if (last) @as(u8, 0x40) else 0);
+                @memcpy(packet[rtp_header_size + 2 ..][0..chunk], nal[offset..][0..chunk]);
+                sendPacket(fd, packet[0 .. rtp_header_size + 2 + chunk]);
+                offset += chunk;
+            }
+        }
+        current = following;
+    }
+}
+
+fn writeRtpHeader(packet: []u8, marker: bool, sequence: *u16, timestamp: u32, ssrc: u32) void {
+    packet[0] = 0x80;
+    packet[1] = rtp_payload_type | (if (marker) @as(u8, 0x80) else 0);
+    std.mem.writeInt(u16, packet[2..4], sequence.*, .big);
+    std.mem.writeInt(u32, packet[4..8], timestamp, .big);
+    std.mem.writeInt(u32, packet[8..12], ssrc, .big);
+    sequence.* +%= 1;
+}
+
+fn sendPacket(fd: std.posix.fd_t, packet: []const u8) void {
+    while (true) {
+        const result = linux.write(fd, packet.ptr, packet.len);
+        switch (linux.errno(result)) {
+            .INTR => continue,
+            else => return,
+        }
+    }
+}
+
+fn writeAll(fd: std.posix.fd_t, data: []const u8) !void {
     var written: usize = 0;
     while (written < data.len) {
         const result = linux.write(fd, data.ptr + written, data.len - written);
         switch (linux.errno(result)) {
             .SUCCESS => {
-                if (result == 0) return error.VideoEncoderPipeClosed;
+                if (result == 0) return error.VideoOutputClosed;
                 written += result;
             },
             .INTR => continue,
-            .AGAIN => {
-                var poll_fds = [_]std.posix.pollfd{
-                    .{ .fd = fd, .events = std.posix.POLL.OUT, .revents = 0 },
-                    .{ .fd = self.work_event_fd, .events = std.posix.POLL.IN, .revents = 0 },
-                    .{ .fd = process.pidfd, .events = std.posix.POLL.IN, .revents = 0 },
-                };
-                _ = try std.posix.poll(&poll_fds, 100);
-                if (poll_fds[1].revents != 0) try drainEvent(self.work_event_fd);
-                if (self.isStopping()) return error.VideoEncoderStopped;
-                if (poll_fds[2].revents != 0) return error.VideoEncoderExited;
-            },
-            .PIPE => return error.VideoEncoderPipeClosed,
-            else => return error.VideoEncoderWriteFailed,
+            else => return error.VideoOutputFailed,
         }
     }
-}
-
-fn processExited(process: *const Process) bool {
-    var poll_fd = [_]std.posix.pollfd{
-        .{ .fd = process.pidfd, .events = std.posix.POLL.IN, .revents = 0 },
-    };
-    _ = std.posix.poll(&poll_fd, 0) catch return true;
-    return poll_fd[0].revents != 0;
 }
 
 fn createEventFd() !std.posix.fd_t {
@@ -557,28 +670,6 @@ fn createEventFd() !std.posix.fd_t {
         .SUCCESS => @intCast(result),
         else => error.EventFdUnavailable,
     };
-}
-
-fn openPidfd(pid: std.process.Child.Id) !std.posix.fd_t {
-    const result = linux.pidfd_open(pid, 0);
-    return switch (linux.errno(result)) {
-        .SUCCESS => @intCast(result),
-        else => error.ProcessMonitoringUnavailable,
-    };
-}
-
-fn setNonblocking(fd: std.posix.fd_t) !void {
-    const result = linux.fcntl(fd, linux.F.GETFL, 0);
-    const flags: i32 = switch (linux.errno(result)) {
-        .SUCCESS => @intCast(result),
-        else => return error.SetNonblockingFailed,
-    };
-    const set_result = linux.fcntl(
-        fd,
-        linux.F.SETFL,
-        @as(usize, @intCast(flags)) | linux.SOCK.NONBLOCK,
-    );
-    if (linux.errno(set_result) != .SUCCESS) return error.SetNonblockingFailed;
 }
 
 fn signalEvent(fd: std.posix.fd_t) !void {
@@ -601,16 +692,18 @@ fn drainEvent(fd: std.posix.fd_t) !void {
     }
 }
 
-fn monotonicMilliseconds() u64 {
+fn monotonicNanoseconds() u64 {
     var timestamp: linux.timespec = undefined;
     _ = linux.clock_gettime(.MONOTONIC, &timestamp);
-    return @as(u64, @intCast(timestamp.sec)) * std.time.ms_per_s +
-        @as(u64, @intCast(timestamp.nsec)) / std.time.ns_per_ms;
+    return @as(u64, @intCast(timestamp.sec)) * std.time.ns_per_s + @as(u64, @intCast(timestamp.nsec));
+}
+
+fn monotonicMilliseconds() u64 {
+    return monotonicNanoseconds() / std.time.ns_per_ms;
 }
 
 test "new captures replace only the pending encoder frame" {
     var encoder = try VideoEncoder.init(std.testing.allocator, std.testing.io, .{
-        .ffmpeg_path = "ffmpeg",
         .rtp_port = 5000,
     });
     defer encoder.deinit();
@@ -625,13 +718,76 @@ test "new captures replace only the pending encoder frame" {
         .input_sequence = 0,
         .fps = 30,
         .bitrate_kbps = 1000,
+        .damage = .{ .first = 0, .end = 1 },
     };
     try std.testing.expectEqual(SubmitResult.queued, try encoder.submit(&.{ 1, 2, 3, 4 }, metadata));
     var replacement = metadata;
     replacement.sequence = 2;
+    replacement.damage = .{ .first = 1, .end = 2 };
     try std.testing.expectEqual(SubmitResult.replaced, try encoder.submit(&.{ 5, 6, 7, 8 }, replacement));
     const pending = encoder.takePending().?;
     defer encoder.release(pending.slot_index);
     try std.testing.expectEqual(@as(u64, 2), pending.metadata.sequence);
+    try std.testing.expectEqual(Rows{ .first = 0, .end = 2 }, pending.metadata.damage);
     try std.testing.expectEqualSlices(u8, &.{ 5, 6, 7, 8 }, pending.data);
+}
+
+test "Annex-B access units split into NAL units without start codes" {
+    const stream = [_]u8{
+        0,    0,    0,    1,    0x09, 0xf0,
+        0,    0,    1,    0x67, 0x42, 0x00,
+        0,    0,    0,    1,    0x65, 0x88,
+        0x00, 0x00, 0x02,
+    };
+    var nals: NalIterator = .{ .data = &stream };
+    try std.testing.expectEqualSlices(u8, &.{ 0x09, 0xf0 }, nals.next().?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x67, 0x42, 0x00 }, nals.next().?);
+    try std.testing.expectEqualSlices(u8, &.{ 0x65, 0x88, 0x00, 0x00, 0x02 }, nals.next().?);
+    try std.testing.expect(nals.next() == null);
+}
+
+test "an encoded keyframe starts with headers and an IDR slice" {
+    var encoder = try Encoder.open(std.testing.allocator, .{
+        .raw_width = 64,
+        .raw_height = 32,
+        .encoded_width = 64,
+        .encoded_height = 32,
+        .fps = 30,
+        .bitrate_kbps = 1000,
+    }, 1, 1);
+    defer encoder.close(std.testing.allocator);
+    const frame = try std.testing.allocator.alloc(u8, 64 * 32 * 4);
+    defer std.testing.allocator.free(frame);
+    @memset(frame, 0x80);
+    var types: [8]u8 = undefined;
+    var count: usize = 0;
+    var nals: NalIterator = .{ .data = try encoder.encode(frame, .{ .first = 0, .end = 0 }) };
+    while (nals.next()) |nal| : (count += 1) types[count] = nal[0] & 0x1f;
+    // SPS, PPS, then one IDR slice per slice group.
+    try std.testing.expectEqualSlices(u8, &.{ 7, 8 }, types[0..2]);
+    try std.testing.expect(count > 2);
+    for (types[2..count]) |nal_type| try std.testing.expectEqual(5, nal_type);
+}
+
+test "after a full frame only damaged rows, widened to whole chroma rows, are converted" {
+    var encoder = try Encoder.open(std.testing.allocator, .{
+        .raw_width = 32,
+        .raw_height = 8,
+        .encoded_width = 32,
+        .encoded_height = 8,
+        .fps = 30,
+        .bitrate_kbps = 1000,
+    }, 1, 1);
+    defer encoder.close(std.testing.allocator);
+    const frame = try std.testing.allocator.alloc(u8, 32 * 8 * 4);
+    defer std.testing.allocator.free(frame);
+    @memset(frame, 0);
+    _ = try encoder.encode(frame, .{ .first = 0, .end = 0 });
+    // Every row turns white, but only row 3 is reported as damaged.
+    @memset(frame, 255);
+    _ = try encoder.encode(frame, .{ .first = 3, .end = 4 });
+    for (0..8) |row| {
+        const expected: u8 = if (row == 2 or row == 3) 235 else 16;
+        for (encoder.planes[row * 32 ..][0..32]) |value| try std.testing.expectEqual(expected, value);
+    }
 }

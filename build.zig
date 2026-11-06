@@ -42,6 +42,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    // Colour conversion and the H.264 encoder are pure computation over
+    // captured pixels. Safety checks cost about 40% of their CPU time, so
+    // release builds of streamd compile them as ReleaseFast, which their hot
+    // functions read to turn the checks off. Their unit tests and h264-check
+    // keep the checks and verify the bitstream bit for bit against FFmpeg.
+    const pixel_optimize: std.builtin.OptimizeMode = if (optimize == .ReleaseSafe) .ReleaseFast else optimize;
+    for ([_][]const u8{ "h264", "ColorConvert" }, [_][]const u8{ "h264/Encoder.zig", "ColorConvert.zig" }) |name, path| {
+        stream_module.addImport(name, b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = pixel_optimize,
+        }));
+    }
     stream_module.addImport("wayland", wayland);
     stream_module.addOptions("build-options", build_options);
     stream_module.linkSystemLibrary("wayland-client", .{});
@@ -82,11 +95,14 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run native and gateway tests");
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = stream_module })).step);
-    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
-        .root_source_file = b.path("h264/Encoder.zig"),
-        .target = target,
-        .optimize = optimize,
-    }) })).step);
+    for ([_][]const u8{ "h264/Encoder.zig", "ColorConvert.zig" }) |path| {
+        const tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(path),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
     const go_test = b.addSystemCommand(&.{ "go", "test", "./..." });
     go_test.setCwd(b.path("gateway"));
     test_step.dependOn(&go_test.step);

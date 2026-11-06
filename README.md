@@ -86,7 +86,8 @@ lives in [`gateway/examples/web`](gateway/examples/web).
 The server distribution contains two processes:
 
 - `waymote-streamd` is a privileged Wayland client responsible for capture,
-  virtual input, clipboard access, output management, and FFmpeg supervision.
+  H.264 encoding, virtual input, clipboard access, output management, and
+  supervising FFmpeg for audio.
 - `waymote-gateway` owns the browser-facing HTTP and WebSocket endpoints. It
   embeds the SDK and example frontend and launches the stream daemon.
 
@@ -106,8 +107,8 @@ browser input and clipboard
   -> Wayland virtual input and data-control protocols
 ```
 
-The server requires FFmpeg with `libx264`, a Pulse-compatible audio source for
-audio, and the relevant Wayland protocols. Server release archives target
+The server requires FFmpeg with `libopus` and a Pulse-compatible audio source
+for audio, and the relevant Wayland protocols. Server release archives target
 Linux x86-64 and ARM64 (`aarch64`).
 
 ## Compositor compatibility
@@ -149,8 +150,8 @@ from unexpected browser origins.
 Waymote is an early release and currently has these constraints:
 
 - Clipboard synchronization is text-only and capped at 1 MiB.
-- The software encoder uses FFmpeg `libx264`; hardware encoding is not yet
-  integrated.
+- Video uses Waymote's own software H.264 encoder (Constrained Baseline);
+  hardware encoding is not yet integrated.
 - Session audio requires a Pulse-compatible monitor source but fails
   independently from video and input.
 - Slow viewers drop stale encoded frames and resume at the next keyframe rather

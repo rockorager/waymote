@@ -7,7 +7,8 @@ release procedures belong in this file rather than in the product overview.
 
 - Zig 0.16.0 and Go 1.26.5 are the supported toolchains.
 - Native builds require Wayland client and xkbcommon development packages.
-- FFmpeg with `libx264` is required at runtime, not at compile time.
+- FFmpeg with `libopus` is required at runtime for session audio, not at
+  compile time.
 - In an Amp orb, `.agents/setup` provisions the toolchains, Labwc, PulseAudio,
   ioquake3, the Quake III demo data, and supporting Wayland utilities.
 

@@ -47,7 +47,7 @@ const usage =
     \\Captures the first Wayland output and writes Annex-B H.264 to stdout.
     \\
     \\options:
-    \\  --ffmpeg PATH       FFmpeg executable (default: ffmpeg)
+    \\  --ffmpeg PATH       FFmpeg executable for session audio (default: ffmpeg)
     \\  --frame-rate FPS    encoder frame rate (default: 30)
     \\  --bitrate KBPS      encoder target bitrate (default: 12000)
     \\  --rtp-port PORT     send H.264 RTP to a loopback UDP port
@@ -91,6 +91,9 @@ height: u32 = 0,
 stride: u32 = 0,
 capture_format: ?wl.Shm.Format = null,
 constraints_received: bool = false,
+copying_with_damage: bool = false,
+damage_first_row: u32 = 0,
+damage_end_row: u32 = 0,
 captured_once: bool = false,
 cursor_overlay: bool = false,
 acknowledged_keyframe_generation: u32 = 0,
@@ -139,7 +142,6 @@ pub fn main(init: std.process.Init) !void {
         .options = options,
         .output_management = .init(init.gpa),
         .video_encoder = try .init(init.gpa, init.io, .{
-            .ffmpeg_path = options.ffmpeg_path,
             .rtp_port = options.rtp_port,
         }),
         .remote_input = .init(init.gpa, init.io, options.xkb_layout),
@@ -674,6 +676,13 @@ fn encodedDimensions(raw_width: u32, raw_height: u32, requested_scale: u32, fram
     }
 }
 
+/// Full copies, and damage copies that reported no region, refresh every row.
+fn damagedRows(with_damage: bool, first_row: u32, end_row: u32, height: u32) VideoEncoder.Rows {
+    const end = @min(end_row, height);
+    if (!with_damage or first_row >= end) return .{ .first = 0, .end = height };
+    return .{ .first = first_row, .end = end };
+}
+
 fn submitFrame(self: *Stream) void {
     const mapping = self.mapping orelse return self.fail(error.MissingCaptureBuffer);
     var timestamp: std.os.linux.timespec = undefined;
@@ -697,6 +706,12 @@ fn submitFrame(self: *Stream) void {
         .input_sequence = self.latest_input_sequence,
         .fps = self.options.frame_rate,
         .bitrate_kbps = self.options.bitrate_kbps,
+        .damage = damagedRows(
+            self.copying_with_damage,
+            self.damage_first_row,
+            self.damage_end_row,
+            self.height,
+        ),
     };
     _ = self.video_encoder.submit(mapping, metadata) catch |err| {
         self.fail(err);
@@ -884,11 +899,14 @@ fn frameListener(
         },
         .buffer_done => {
             if (!self.constraints_received) return self.fail(error.MissingBufferConstraints);
-            if (waitForDamage(
+            self.copying_with_damage = waitForDamage(
                 self.captured_once,
                 self.generation,
                 self.acknowledged_keyframe_generation,
-            )) {
+            );
+            self.damage_first_row = std.math.maxInt(u32);
+            self.damage_end_row = 0;
+            if (self.copying_with_damage) {
                 self.frame.?.copyWithDamage(self.buffer.?);
             } else {
                 self.frame.?.copy(self.buffer.?);
@@ -900,7 +918,11 @@ fn frameListener(
         },
         .ready => self.submitFrame(),
         .failed => self.fail(error.CaptureFailed),
-        .damage, .linux_dmabuf => {},
+        .damage => |damage| {
+            self.damage_first_row = @min(self.damage_first_row, damage.y);
+            self.damage_end_row = @max(self.damage_end_row, damage.y +| damage.height);
+        },
+        .linux_dmabuf => {},
     }
 }
 
@@ -1186,6 +1208,16 @@ test "relative pointer input controls cursor compositing" {
     try std.testing.expect(!cursorOverlayForCommand(true, .release_all));
 }
 
+test "only damage copies with a reported region limit the refreshed rows" {
+    try std.testing.expectEqual(VideoEncoder.Rows{ .first = 0, .end = 720 }, damagedRows(false, 10, 20, 720));
+    try std.testing.expectEqual(VideoEncoder.Rows{ .first = 10, .end = 20 }, damagedRows(true, 10, 20, 720));
+    try std.testing.expectEqual(VideoEncoder.Rows{ .first = 700, .end = 720 }, damagedRows(true, 700, 900, 720));
+    try std.testing.expectEqual(
+        VideoEncoder.Rows{ .first = 0, .end = 720 },
+        damagedRows(true, std.math.maxInt(u32), 0, 720),
+    );
+}
+
 test "capture waits for damage only after current generation keyframe acknowledgement" {
     var acknowledged_generation: u32 = 0;
     const generation: u32 = 7;
@@ -1247,4 +1279,8 @@ test "clipboard records decode a bounded payload length" {
 
     std.mem.writeInt(u32, record[4..8], Clipboard.maximum_text_bytes + 1, .little);
     try std.testing.expectError(error.InvalidClipboardRecord, decodeClipboardLength(&record));
+}
+
+test {
+    _ = VideoEncoder;
 }
