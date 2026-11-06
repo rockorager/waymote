@@ -694,7 +694,7 @@ test("video keyframes wait for decoder setup and reject stale sessions", async (
   await session.dispose();
 });
 
-async function pendingVideoSetup(t) {
+async function pendingVideoSetup(t, configuration = {}) {
   const fakeWindow = new FakeTarget();
   fakeWindow.devicePixelRatio = 1;
   fakeWindow.VideoDecoder = true;
@@ -709,7 +709,8 @@ async function pendingVideoSetup(t) {
     static CLOSED = 3;
     readyState = FakeWebSocket.CONNECTING;
     binaryType = "";
-    send() {}
+    sent = [];
+    send(data) { this.sent.push(data); }
     close() { this.readyState = FakeWebSocket.CLOSED; }
   }
   globalThis.WebSocket = FakeWebSocket;
@@ -765,7 +766,7 @@ async function pendingVideoSetup(t) {
     return buffer;
   };
   const configure = (socket = sockets.get("/stream")) => socket.dispatch("message", {
-    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E" }),
+    data: JSON.stringify({ type: "video-config", codec: "avc1.42E01E", ...configuration }),
   });
   configure();
   return { session, sockets, setups, decodedTimestamps, message, configure };
@@ -808,6 +809,26 @@ for (const [name, flags, expected] of [
     // Live messages must follow the buffered group, not remain queued after setup.
     socket.dispatch("message", { data: message(100, 1) });
     assert.deepEqual(decodedTimestamps, [...expected, 100]);
+  });
+}
+
+for (const [name, configuration, expected] of [
+  ["requests keyframes from servers that accept them", { keyframeRequests: true },
+    [{ type: "keyframe-requests" }, { type: "keyframe" }]],
+  ["sends nothing to servers that do not accept keyframe requests", {}, []],
+]) {
+  test(`video decoder ${name}`, async (t) => {
+    const { sockets, setups, decodedTimestamps, message } = await pendingVideoSetup(t, configuration);
+    const socket = sockets.get("/stream");
+    socket.readyState = WebSocket.OPEN;
+    setups[0].resolve({ supported: true });
+    await settleVideoSetup();
+    socket.dispatch("message", { data: message(1, 1) });
+    socket.dispatch("message", { data: message(2, 2) });
+    socket.dispatch("message", { data: message(3) });
+    socket.dispatch("message", { data: message(4, 1) });
+    assert.deepEqual(decodedTimestamps, [1, 4]);
+    assert.deepEqual(socket.sent.map((data) => JSON.parse(data)), expected);
   });
 }
 

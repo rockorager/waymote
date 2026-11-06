@@ -19,7 +19,8 @@ const slot_count = 3;
 const initial_restart_delay_ms = 1000;
 const maximum_restart_delay_ms = 30_000;
 const stable_run_ms = 30_000;
-/// The gateway's bootstrap buffer holds at most 240 frames of a GOP.
+/// Viewers ask for keyframes when they need one, so periodic keyframes only
+/// keep each GOP within the gateway's bootstrap buffer of 240 frames.
 const max_gop_length = 240;
 /// How long captures must pause before the encoder re-sends the last picture
 /// to sharpen what rate control left coarse.
@@ -152,7 +153,7 @@ const Encoder = struct {
             .qp = finest_qp,
             .bitrate_kbps = config.bitrate_kbps,
             .fps = config.fps,
-            .keyframe_interval = config.fps,
+            .keyframe_interval = max_gop_length,
             .max_gop_length = max_gop_length,
         });
         log.info("capturing {}x{} at {d} FPS and {d} kbps", .{
@@ -179,7 +180,7 @@ const Encoder = struct {
 
     /// Encodes one captured frame and returns its Annex-B access unit, which
     /// stays valid until the next call.
-    fn encode(self: *Encoder, data: []const u8, damage: Rows) ![]const u8 {
+    fn encode(self: *Encoder, data: []const u8, damage: Rows, force_keyframe: bool) ![]const u8 {
         const width: usize = self.config.encoded_width;
         const height: usize = self.config.encoded_height;
         const raw_width: usize = self.config.raw_width;
@@ -204,11 +205,11 @@ const Encoder = struct {
             rows.end,
         );
         self.planes_complete = true;
-        return self.encodePlanes(rows);
+        return self.encodePlanes(rows, force_keyframe);
     }
 
     /// Encodes the converted planes, of which only `rows` changed.
-    fn encodePlanes(self: *Encoder, rows: Rows) ![]const u8 {
+    fn encodePlanes(self: *Encoder, rows: Rows, force_keyframe: bool) ![]const u8 {
         const width: usize = self.config.encoded_width;
         const height: usize = self.config.encoded_height;
         return self.h264.encode(.{
@@ -217,14 +218,15 @@ const Encoder = struct {
             .v = self.planes[width * height * 5 / 4 ..][0 .. width * height / 4],
             .y_stride = width,
             .chroma_stride = width / 2,
-        }, .{ .first = rows.first, .end = rows.end }, false);
+        }, .{ .first = rows.first, .end = rows.end }, force_keyframe);
     }
 
-    /// Re-codes macroblocks that rate control left coarse at a finer QP while
-    /// nothing changes on screen. Null means there is nothing to send this
-    /// interval.
-    fn refine(self: *Encoder) !?[]const u8 {
+    /// Encodes the last picture again while nothing changes on screen: as a
+    /// keyframe, or else coding macroblocks that rate control left coarse at
+    /// a finer QP. Null means there is nothing to send this interval.
+    fn encodeIdle(self: *Encoder, keyframe: bool) !?[]const u8 {
         std.debug.assert(self.planes_complete);
+        if (keyframe) return try self.encodePlanes(.{ .first = 0, .end = 0 }, true);
         return self.h264.refine();
     }
 
@@ -243,6 +245,7 @@ pending_slot: ?usize = null,
 notification: ?Notification = null,
 completion: Completion = .{ .generation = 0, .encode = false },
 stopping: bool = false,
+keyframe_requested: bool = false,
 work_event_fd: std.posix.fd_t,
 notification_event_fd: std.posix.fd_t,
 thread: ?std.Thread = null,
@@ -311,6 +314,22 @@ pub fn submit(self: *VideoEncoder, data: []const u8, metadata: Metadata) !Submit
     return if (replacing) .replaced else .queued;
 }
 
+/// Makes the next encoded frame a keyframe, re-encoding the last picture if
+/// no capture arrives first.
+pub fn requestKeyframe(self: *VideoEncoder) !void {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    self.keyframe_requested = true;
+    try signalEvent(self.work_event_fd);
+}
+
+fn takeKeyframeRequest(self: *VideoEncoder) bool {
+    self.mutex.lockUncancelable(self.io);
+    defer self.mutex.unlock(self.io);
+    defer self.keyframe_requested = false;
+    return self.keyframe_requested;
+}
+
 pub fn notificationFd(self: *const VideoEncoder) std.posix.fd_t {
     return self.notification_event_fd;
 }
@@ -369,23 +388,25 @@ fn runInner(self: *VideoEncoder) !void {
         }
 
         const frame = self.takePending() orelse {
-            // Without a capture to encode, an idle screen spends spare bitrate
-            // sharpening the last picture, paced like captures.
+            // Without a capture to encode, a viewer that needs a keyframe gets
+            // the last picture again as one, and otherwise an idle screen
+            // spends spare bitrate sharpening it, paced like captures.
             const active = if (encoder) |*value| value else null;
             if (active == null or last_metadata == null) {
                 try self.waitForEvents(-1);
                 continue;
             }
-            if (!active.?.h264.refinementPending()) {
+            const keyframe = self.takeKeyframeRequest();
+            if (!keyframe and !active.?.h264.refinementPending()) {
                 try self.waitForEvents(-1);
                 continue;
             }
             const refine_at = last_capture_nanos + refine_idle_ns;
-            if (now_nanos < refine_at) {
+            if (!keyframe and now_nanos < refine_at) {
                 try self.waitForEvents(@intCast((refine_at - now_nanos + std.time.ns_per_ms - 1) / std.time.ns_per_ms));
                 continue;
             }
-            const refined = active.?.refine() catch |err| {
+            const refined = active.?.encodeIdle(keyframe) catch |err| {
                 log.warn("idle video encode failed: {t}; retrying in {d} ms", .{ err, restart_delay_ms });
                 active.?.close(self.allocator);
                 encoder = null;
@@ -444,7 +465,7 @@ fn runInner(self: *VideoEncoder) !void {
         // the previous generation. The encoder owns the media generation.
         metadata.generation = active.generation;
 
-        const access_unit = active.encode(frame.data, metadata.damage) catch |err| {
+        const access_unit = active.encode(frame.data, metadata.damage, self.takeKeyframeRequest()) catch |err| {
             log.warn("video encode failed: {t}; retrying in {d} ms", .{ err, restart_delay_ms });
             active.close(self.allocator);
             encoder = null;
@@ -761,12 +782,39 @@ test "an encoded keyframe starts with headers and an IDR slice" {
     @memset(frame, 0x80);
     var types: [8]u8 = undefined;
     var count: usize = 0;
-    var nals: NalIterator = .{ .data = try encoder.encode(frame, .{ .first = 0, .end = 0 }) };
+    var nals: NalIterator = .{ .data = try encoder.encode(frame, .{ .first = 0, .end = 0 }, false) };
     while (nals.next()) |nal| : (count += 1) types[count] = nal[0] & 0x1f;
     // SPS, PPS, then one IDR slice per slice group.
     try std.testing.expectEqualSlices(u8, &.{ 7, 8 }, types[0..2]);
     try std.testing.expect(count > 2);
     for (types[2..count]) |nal_type| try std.testing.expectEqual(5, nal_type);
+}
+
+test "a requested keyframe interrupts the GOP" {
+    var encoder = try Encoder.open(std.testing.allocator, .{
+        .raw_width = 64,
+        .raw_height = 32,
+        .encoded_width = 64,
+        .encoded_height = 32,
+        .fps = 30,
+        .bitrate_kbps = 1000,
+    }, 1, 1);
+    defer encoder.close(std.testing.allocator);
+    const frame = try std.testing.allocator.alloc(u8, 64 * 32 * 4);
+    defer std.testing.allocator.free(frame);
+    @memset(frame, 0x80);
+    _ = try encoder.encode(frame, .{ .first = 0, .end = 0 }, false);
+    frame[0] = 0;
+    try std.testing.expect(!containsIdr(try encoder.encode(frame, .{ .first = 0, .end = 1 }, false)));
+    try std.testing.expect(containsIdr((try encoder.encodeIdle(true)).?));
+    frame[0] = 0xff;
+    try std.testing.expect(containsIdr(try encoder.encode(frame, .{ .first = 0, .end = 1 }, true)));
+}
+
+fn containsIdr(access_unit: []const u8) bool {
+    var nals: NalIterator = .{ .data = access_unit };
+    while (nals.next()) |nal| if (nal[0] & 0x1f == 5) return true;
+    return false;
 }
 
 test "after a full frame only damaged rows, widened to whole chroma rows, are converted" {
@@ -782,10 +830,10 @@ test "after a full frame only damaged rows, widened to whole chroma rows, are co
     const frame = try std.testing.allocator.alloc(u8, 32 * 8 * 4);
     defer std.testing.allocator.free(frame);
     @memset(frame, 0);
-    _ = try encoder.encode(frame, .{ .first = 0, .end = 0 });
+    _ = try encoder.encode(frame, .{ .first = 0, .end = 0 }, false);
     // Every row turns white, but only row 3 is reported as damaged.
     @memset(frame, 255);
-    _ = try encoder.encode(frame, .{ .first = 3, .end = 4 });
+    _ = try encoder.encode(frame, .{ .first = 3, .end = 4 }, false);
     for (0..8) |row| {
         const expected: u8 = if (row == 2 or row == 3) 235 else 16;
         for (encoder.planes[row * 32 ..][0..32]) |value| try std.testing.expectEqual(expected, value);

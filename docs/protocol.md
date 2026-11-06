@@ -19,6 +19,13 @@ FPS, and encoded scale percent. Text (type 10) is followed by at most 4000
 UTF-8 bytes without NUL; state 1 is preedit and state 0 is commit, payload
 length is `a`, and input sequence is `b`.
 
+Two types travel only from the gateway to the stream daemon. Keyframe readiness
+(type 11) reports whether the gateway holds a keyframe of generation `a`
+(`state` 1) or lost it (`state` 0); the daemon then sends a new keyframe. A
+keyframe request (type 12) makes the daemon's next frame a keyframe; all its
+fields after `type` are zero. The gateway sends one when a viewer cannot decode
+until the next keyframe, coalescing requests until a keyframe arrives.
+
 Key records use the Linux evdev keycode in `a`. On a press, `b` may contain the
 browser-resolved XKB keysym for one printable character. Latin-1 characters use
 their standard keysym value; other Unicode scalar values use `0x01000000 | codepoint`.
@@ -51,6 +58,16 @@ Browser video messages use a 40-byte header: version, type, flags, and reserved
 (4 bytes); media sequence (8); media timestamp in microseconds (8); generation
 (4); encoded width and height (2 each); capture monotonic nanoseconds (8); and
 latest applied input sequence (4). One Annex-B access unit follows the header.
+
+Before any video message, the gateway sends a JSON `video-config` text message
+with `codec` and `frameRate`. When it also carries `keyframeRequests: true`, the
+viewer may send two JSON text messages on the video socket: `{"type":
+"keyframe-requests"}` once, declaring that it will ask for keyframes itself, and
+`{"type": "keyframe"}` whenever its decoder must wait for one. Servers that do
+not advertise `keyframeRequests` close the connection on any viewer message, so
+viewers must not send these to them. While any connected viewer has not
+declared `keyframe-requests`, the gateway keeps requesting a keyframe every
+`frameRate` frames so that viewer can still recover from a local decoder reset.
 
 Capture and browser clocks are not assumed comparable. Low-RTT ping/pong
 samples estimate the offset between server `CLOCK_MONOTONIC` and browser

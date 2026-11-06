@@ -61,6 +61,9 @@ const (
 	controlQuality         = 9
 	controlText            = 10
 	controlKeyframeReady   = 11
+	controlKeyframeRequest = 12
+	keyframeRequestRetry   = time.Second
+	keyframeRequestSpacing = 500 * time.Millisecond
 	streamClipboard        = 1
 	streamFrameMetadata    = 2
 	streamResizeApplied    = 3
@@ -103,6 +106,11 @@ type frameMetadata struct {
 type subscriber struct {
 	frames             chan sample
 	waitingForKeyframe bool
+	// requestsKeyframes is set once the viewer says it asks for a keyframe
+	// whenever its decoder resets. Viewers that never say so (older SDKs)
+	// recover only at periodic keyframes, so the hub requests one every
+	// legacyKeyframeInterval frames while any of them is connected.
+	requestsKeyframes bool
 }
 
 type audioSample struct {
@@ -166,13 +174,89 @@ func drainAudioPackets(packets chan audioSample) {
 }
 
 type hub struct {
-	mu          sync.Mutex
-	subscribers map[*subscriber]struct{}
-	latestGOP   []sample
+	mu                     sync.Mutex
+	subscribers            map[*subscriber]struct{}
+	latestGOP              []sample
+	keyframes              *keyframeRequester
+	legacyKeyframeInterval int
+	framesSinceKeyframe    int
 }
 
-func newHub() *hub {
-	return &hub{subscribers: make(map[*subscriber]struct{})}
+// newHub returns a hub that asks the encoder for keyframes through
+// writeControl; a nil writeControl drops the requests.
+func newHub(frameRate uint64, writeControl func([]byte) error) *hub {
+	return &hub{
+		subscribers:            make(map[*subscriber]struct{}),
+		keyframes:              &keyframeRequester{write: writeControl},
+		legacyKeyframeInterval: int(frameRate),
+	}
+}
+
+// keyframeRequester asks the encoder for a keyframe on behalf of viewers that
+// cannot decode until the next one. Requests coalesce: one stays outstanding
+// until a keyframe arrives or keyframeRequestRetry passes, and requests come
+// at least keyframeRequestSpacing after the previous keyframe so a congested
+// viewer cannot turn every keyframe into another one.
+type keyframeRequester struct {
+	mu         sync.Mutex
+	write      func([]byte) error
+	pending    bool
+	sentAt     time.Time
+	keyframeAt time.Time
+	timer      *time.Timer
+}
+
+func (r *keyframeRequester) request() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.timer != nil || r.pending && time.Since(r.sentAt) < keyframeRequestRetry {
+		return
+	}
+	wait := keyframeRequestSpacing - time.Since(r.keyframeAt)
+	if wait <= 0 {
+		r.sendLocked()
+		return
+	}
+	var timer *time.Timer
+	timer = time.AfterFunc(wait, func() {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if r.timer == timer {
+			r.timer = nil
+			r.sendLocked()
+		}
+	})
+	r.timer = timer
+}
+
+func (r *keyframeRequester) sendLocked() {
+	if r.write == nil {
+		return
+	}
+	if err := r.write(encodeKeyframeRequest()); err != nil {
+		log.Printf("keyframe request failed: %v", err)
+		return
+	}
+	r.pending = true
+	r.sentAt = time.Now()
+}
+
+func (r *keyframeRequester) delivered() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pending = false
+	r.keyframeAt = time.Now()
+	if r.timer != nil {
+		r.timer.Stop()
+		r.timer = nil
+	}
+}
+
+// acceptKeyframeRequests records that subscriber asks for keyframes itself.
+func (h *hub) acceptKeyframeRequests(subscriber *subscriber) {
+	h.mu.Lock()
+	subscriber.requestsKeyframes = true
+	h.mu.Unlock()
 }
 
 func (h *hub) subscribe() (*subscriber, []sample) {
@@ -197,8 +281,13 @@ func (h *hub) broadcast(frame sample) bool {
 		h.latestGOP = nil
 	}
 	if frame.key {
+		h.framesSinceKeyframe = 0
+		h.keyframes.delivered()
 		h.latestGOP = append(make([]sample, 0, 241), frame)
-	} else if len(h.latestGOP) > 0 {
+	} else {
+		h.framesSinceKeyframe++
+	}
+	if !frame.key && len(h.latestGOP) > 0 {
 		// The encoder keyframe interval is bounded to at most 240 frames.
 		// If that invariant is ever broken, discard the stale bootstrap
 		// rather than retaining an unbounded stream.
@@ -208,10 +297,15 @@ func (h *hub) broadcast(frame sample) bool {
 			h.latestGOP = h.latestGOP[:0]
 		}
 	}
+	wantKeyframe := false
 	for subscriber := range h.subscribers {
+		if !subscriber.requestsKeyframes && h.framesSinceKeyframe >= h.legacyKeyframeInterval {
+			wantKeyframe = true
+		}
 		outgoing := frame
 		if subscriber.waitingForKeyframe {
 			if !frame.key {
+				wantKeyframe = true
 				continue
 			}
 			outgoing.discontinuity = true
@@ -225,7 +319,11 @@ func (h *hub) broadcast(frame sample) bool {
 			// loop on a reliable transport.
 			drainFrames(subscriber.frames)
 			subscriber.waitingForKeyframe = true
+			wantKeyframe = true
 		}
+	}
+	if wantKeyframe {
+		h.keyframes.request()
 	}
 	return len(h.latestGOP) > 0 && h.latestGOP[0].generation == frame.generation
 }
@@ -426,13 +524,18 @@ func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
 	log.Printf("video client %d connected: user-agent=%q", clientID, r.UserAgent())
 	defer log.Printf("video client %d disconnected", clientID)
 	connection.SetReadLimit(4 << 10)
-	ctx := connection.CloseRead(r.Context())
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
 
+	// keyframeRequests tells the viewer it may send the text messages read
+	// below. Peers that do not advertise it, such as older gateways, close
+	// the connection on any viewer message.
 	configuration, _ := json.Marshal(map[string]any{
-		"type":      "video-config",
-		"version":   protocolVersion,
-		"codec":     "avc1.42E034",
-		"frameRate": g.frameRate,
+		"type":             "video-config",
+		"version":          protocolVersion,
+		"codec":            "avc1.42E034",
+		"frameRate":        g.frameRate,
+		"keyframeRequests": true,
 	})
 	if err := connection.Write(ctx, websocket.MessageText, configuration); err != nil {
 		log.Printf("video client %d configuration write failed: %v", clientID, err)
@@ -441,6 +544,31 @@ func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
 
 	subscriber, bootstrap := g.hub.subscribe()
 	defer g.hub.unsubscribe(subscriber)
+	go func() {
+		defer cancel()
+		for {
+			kind, message, err := connection.Read(ctx)
+			if err != nil {
+				log.Printf("video client %d read side closed: %v", clientID, err)
+				return
+			}
+			var request struct {
+				Type string `json:"type"`
+			}
+			if kind != websocket.MessageText || json.Unmarshal(message, &request) != nil {
+				continue
+			}
+			switch request.Type {
+			case "keyframe-requests":
+				g.hub.acceptKeyframeRequests(subscriber)
+			case "keyframe":
+				g.hub.keyframes.request()
+			}
+		}
+	}()
+	if len(bootstrap) == 0 || !bootstrap[0].key {
+		g.hub.keyframes.request()
+	}
 	waitingForKeyframe := true
 	writeFrame := func(frame sample) error {
 		if waitingForKeyframe && !frame.key {
@@ -458,7 +586,6 @@ func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("video client %d read side closed: %v", clientID, ctx.Err())
 			return
 		case frame, ok := <-subscriber.frames:
 			if !ok {
@@ -871,6 +998,13 @@ func encodeQuality(p qualityPolicy) []byte {
 	return r
 }
 
+func encodeKeyframeRequest() []byte {
+	record := make([]byte, controlSize)
+	record[0] = protocolVersion
+	record[1] = controlKeyframeRequest
+	return record
+}
+
 func encodeKeyframeReadiness(generation uint32, ready bool) []byte {
 	record := make([]byte, controlSize)
 	record[0] = protocolVersion
@@ -1102,9 +1236,9 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	hub := newHub()
-	audio := newAudioHub()
 	input := &inputBridge{}
+	hub := newHub(*frameRate, input.write)
+	audio := newAudioHub()
 	clipboard := &clipboardBridge{}
 	events := &messageBridge{}
 	go func() {

@@ -19,6 +19,7 @@ const relative_pointer_command = 8;
 const quality_command = 9;
 const text_command = 10;
 const keyframe_acknowledgement_command = 11;
+const keyframe_request_command = 12;
 const stream_frame_metadata = 2;
 const stream_resize_applied = 3;
 const maximum_text_bytes = 4000;
@@ -313,7 +314,14 @@ fn readControl(self: *Stream) !void {
                 self.generation,
                 &self.acknowledged_keyframe_generation,
                 try decodeKeyframeAcknowledgement(&record),
-            )) try self.rearmCapture();
+            )) {
+                // The gateway lost its keyframe, so new viewers cannot start.
+                try self.video_encoder.requestKeyframe();
+                try self.rearmCapture();
+            }
+        } else if (record[1] == keyframe_request_command) {
+            try decodeKeyframeRequest(&record);
+            try self.video_encoder.requestKeyframe();
         } else if (record[1] == quality_command) {
             const quality = try decodeQuality(&record);
             if (quality.bitrate != self.options.bitrate_kbps or quality.fps != self.options.frame_rate or
@@ -969,6 +977,12 @@ fn decodeKeyframeAcknowledgement(
     const generation = std.mem.readInt(u32, record[4..8], .little);
     if (generation == 0) return error.InvalidKeyframeAcknowledgement;
     return .{ .generation = generation, .ready = record[2] == 1 };
+}
+
+fn decodeKeyframeRequest(record: *const [RemoteInput.record_size]u8) !void {
+    if (record[0] != 2 or record[1] != keyframe_request_command or !std.mem.allEqual(u8, record[2..16], 0)) {
+        return error.InvalidKeyframeRequest;
+    }
 }
 
 fn decodeTextLength(record: *const [16]u8) !usize {

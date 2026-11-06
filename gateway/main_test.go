@@ -274,7 +274,7 @@ func TestDecodeClipboardRequestRejectsOversizedText(t *testing.T) {
 }
 
 func TestHubResynchronizesSlowSubscriberWithoutDisconnecting(t *testing.T) {
-	hub := newHub()
+	hub := newHub(30, nil)
 	subscriber, _ := hub.subscribe()
 	defer hub.unsubscribe(subscriber)
 
@@ -302,8 +302,71 @@ func TestHubResynchronizesSlowSubscriberWithoutDisconnecting(t *testing.T) {
 	}
 }
 
+func TestHubRequestsOneKeyframeForSlowSubscriber(t *testing.T) {
+	var requests [][]byte
+	hub := newHub(30, func(record []byte) error {
+		requests = append(requests, record)
+		return nil
+	})
+	subscriber, _ := hub.subscribe()
+	defer hub.unsubscribe(subscriber)
+	hub.acceptKeyframeRequests(subscriber)
+
+	hub.broadcast(sample{key: true, sequence: 0})
+	<-subscriber.frames
+	time.Sleep(keyframeRequestSpacing)
+	for sequence := uint64(1); sequence <= 20; sequence++ {
+		hub.broadcast(sample{sequence: sequence})
+	}
+	if len(requests) != 1 {
+		t.Fatalf("keyframe requests = %v, want one", requests)
+	}
+	if want := append([]byte{2, 12}, make([]byte, 14)...); string(requests[0]) != string(want) {
+		t.Fatalf("keyframe request record = %v, want %v", requests[0], want)
+	}
+	hub.broadcast(sample{key: true, sequence: 21})
+	if recovered := <-subscriber.frames; !recovered.key || !recovered.discontinuity {
+		t.Fatalf("unexpected recovery frame: %+v", recovered)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("keyframe requests after recovery = %d, want 1", len(requests))
+	}
+}
+
+func TestHubKeepsPeriodicKeyframesOnlyForLegacySubscribers(t *testing.T) {
+	requests := 0
+	hub := newHub(30, func([]byte) error {
+		requests++
+		return nil
+	})
+	subscriber, _ := hub.subscribe()
+	defer hub.unsubscribe(subscriber)
+	hub.acceptKeyframeRequests(subscriber)
+	broadcast := func(frame sample) {
+		hub.broadcast(frame)
+		<-subscriber.frames
+	}
+
+	broadcast(sample{key: true})
+	time.Sleep(keyframeRequestSpacing)
+	for range 100 {
+		broadcast(sample{})
+	}
+	if requests != 0 {
+		t.Fatalf("keyframe requests with a requesting viewer = %d, want 0", requests)
+	}
+
+	legacy, _ := hub.subscribe()
+	defer hub.unsubscribe(legacy)
+	hub.broadcast(sample{})
+	<-subscriber.frames
+	if requests != 1 {
+		t.Fatalf("keyframe requests with a legacy viewer = %d, want 1", requests)
+	}
+}
+
 func TestHubBootstrapsIdleSubscriberFromLatestGOP(t *testing.T) {
-	hub := newHub()
+	hub := newHub(30, nil)
 	hub.broadcast(sample{key: true, sequence: 20, data: []byte{1}})
 	hub.broadcast(sample{sequence: 21, data: []byte{2}})
 
@@ -316,7 +379,7 @@ func TestHubBootstrapsIdleSubscriberFromLatestGOP(t *testing.T) {
 }
 
 func TestVideoPublisherTracksCachedKeyframeReadiness(t *testing.T) {
-	hub := newHub()
+	hub := newHub(30, nil)
 	writer := &keyframeAcknowledgementWriter{hub: hub}
 	input := &inputBridge{}
 	input.attach(writer)

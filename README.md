@@ -154,8 +154,8 @@ Waymote is an early release and currently has these constraints:
   hardware encoding is not yet integrated.
 - Session audio requires a Pulse-compatible monitor source but fails
   independently from video and input.
-- Slow viewers drop stale encoded frames and resume at the next keyframe rather
-  than accumulating latency.
+- Slow viewers drop stale encoded frames and resume at a keyframe the gateway
+  requests for them rather than accumulating latency.
 - Packaged servers target Linux x86-64 and ARM64.
 
 The binary protocol is documented separately in

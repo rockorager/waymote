@@ -86,6 +86,12 @@ let videoReconnectTimer = null;
 let videoConnectAttempt = null;
 let decoderConfiguration = null;
 let waitingForKeyframe = true;
+// The video socket whose server advertised `keyframeRequests`. Servers that do
+// not advertise it close the connection on any viewer message, so the SDK
+// sends nothing on other sockets.
+let keyframeRequestSocket = null;
+let lastKeyframeRequest = -Infinity;
+const keyframeRequestIntervalMilliseconds = 1000;
 let decoderGeneration = 0;
 let receivedChunks = 0;
 let receivedKeyframes = 0;
@@ -1498,6 +1504,7 @@ function decodeMessage(buffer) {
     waitingForKeyframe = true;
   }
   if (waitingForKeyframe && !keyframe) {
+    requestKeyframe();
     return;
   }
   waitingForKeyframe = false;
@@ -1506,6 +1513,15 @@ function decodeMessage(buffer) {
     timestamp,
     data: new Uint8Array(buffer, headerSize),
   }));
+}
+
+function requestKeyframe() {
+  const socket = keyframeRequestSocket;
+  if (!socket || socket !== videoSocket || socket.readyState !== WebSocket.OPEN) return;
+  const now = performance.now();
+  if (now - lastKeyframeRequest < keyframeRequestIntervalMilliseconds) return;
+  lastKeyframeRequest = now;
+  socket.send(JSON.stringify({ type: "keyframe" }));
 }
 
 function handleCompositionUpdate(event) {
@@ -1660,6 +1676,10 @@ async function connectVideo() {
     if (typeof event.data === "string") {
       const message = JSON.parse(event.data);
       if (message.type === "video-config") {
+        keyframeRequestSocket = message.keyframeRequests === true ? socket : null;
+        if (keyframeRequestSocket) {
+          socket.send(JSON.stringify({ type: "keyframe-requests" }));
+        }
         clearPendingDecoderMessages();
         const messages = [];
         pendingDecoderMessages = messages;
