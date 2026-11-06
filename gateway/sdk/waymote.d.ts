@@ -138,6 +138,10 @@ export interface SurfaceOptions {
   readonly textInputElement?: HTMLInputElement | HTMLTextAreaElement;
   readonly remoteDisplay?: RemoteDisplayPolicy;
   readonly controlOnFocus?: boolean;
+  /**
+   * Writes new remote copies to the host clipboard while the page has focus.
+   * The clipboard the gateway replays when it grants control is not written.
+   */
   readonly clipboardAutoSync?: boolean;
 }
 

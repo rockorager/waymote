@@ -212,6 +212,7 @@ let resizeRequestID = 0;
 let qualityBitrate = 0;
 let qualityScale = 100;
 let remoteClipboard = null;
+let clipboardSnapshotPending = false;
 let clipboardPasteModifiers = null;
 let pendingClipboardCopy = null;
 let shortcutClipboardCopy = null;
@@ -657,6 +658,8 @@ function completeShortcutClipboardCopy() {
 }
 
 function receiveRemoteClipboard(text) {
+  const snapshot = clipboardSnapshotPending;
+  clipboardSnapshotPending = false;
   remoteClipboard = text;
   setClipboardStatus(text.length === 0 ? "Remote clipboard empty" : "Remote clipboard ready");
   if (shortcutClipboardCopy) {
@@ -670,7 +673,10 @@ function receiveRemoteClipboard(text) {
     transaction.resolve(text);
     return;
   }
-  if (text.length === 0) {
+  // The replay that follows a claim of control is the remote clipboard as it
+  // already was, not a new remote copy. Writing it would replace a fresh host
+  // copy just because the user focused the desktop to paste it.
+  if (text.length === 0 || snapshot) {
     return;
   }
   if (clipboardAutoSync && !document.hidden && document.hasFocus() && navigator.clipboard?.writeText) {
@@ -711,6 +717,14 @@ function tapRemoteKey(key, modifiers) {
       sendControl(keyboardRecord(modifier, keyReleased));
     }
   }
+}
+
+// The gateway replays its latest clipboard each time it grants control. Mark
+// that replay so it is not mistaken for a new remote copy. An acquire sent
+// while control is already active only confirms it and replays nothing.
+function sendAcquire(socket) {
+  if (!controlActive) clipboardSnapshotPending = true;
+  socket.send("acquire");
 }
 
 function updateControlStatus() {
@@ -890,7 +904,7 @@ function requestControl() {
   }
   if (sessionConnected) void connectControl();
   if (controlSocket && controlSocket.readyState === WebSocket.OPEN) {
-    controlSocket.send("acquire");
+    sendAcquire(controlSocket);
     setControlStatus("Input requesting");
   }
 }
@@ -917,7 +931,7 @@ function retryControlAcquire() {
   if (!controlWanted || !controlSocket || controlSocket.readyState !== WebSocket.OPEN) {
     return;
   }
-  controlSocket.send("acquire");
+  sendAcquire(controlSocket);
   controlAcquireDelay = Math.min(controlAcquireDelay * 2, 2000);
   controlAcquireTimer = setTimeout(retryControlAcquire, controlAcquireDelay);
 }
@@ -969,7 +983,7 @@ async function connectControl() {
       return;
     }
     if (controlWanted) {
-      socket.send("acquire");
+      sendAcquire(socket);
     }
     for (const record of pendingControlRecords) {
       sendControl(record);

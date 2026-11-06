@@ -1312,3 +1312,33 @@ test("a macOS remote pastes with its own Command-V shortcut", async (t) => {
 test("remote platforms other than linux and macos are rejected", () => {
   assert.throws(() => new WaymoteSession({ remotePlatform: "darwin" }), /Unknown remote platform/);
 });
+
+test("clipboard replays after a control claim do not overwrite the host clipboard", async (t) => {
+  const { session, navigator, receive, control } = await controlledSession(t);
+  const written = [];
+  navigator.clipboard = { writeText: async (text) => { written.push(text); } };
+  const remoteCopy = (text) => receive({ type: "clipboard", text });
+
+  // The replay may arrive on either side of the control-state reply.
+  remoteCopy("Replayed on connect");
+  remoteCopy("First remote copy");
+  for (const replayFirst of [true, false]) {
+    session.input.release();
+    session.input.acquire();
+    if (replayFirst) remoteCopy("Replayed on acquire");
+    receive({ type: "control-state", state: "active" });
+    if (!replayFirst) remoteCopy("Replayed on acquire");
+  }
+  // The gateway hands control back after another viewer releases it.
+  receive({ type: "control-state", state: "ready" });
+  assert.equal(control.sent.at(-1), "acquire");
+  remoteCopy("Replayed after ready");
+  receive({ type: "control-state", state: "active" });
+  // Acquiring while already active is only a confirmation without a replay.
+  session.input.acquire();
+  receive({ type: "control-state", state: "active" });
+  remoteCopy("Second remote copy");
+  remoteCopy("Second remote copy");
+  assert.deepEqual(written, ["First remote copy", "Second remote copy", "Second remote copy"]);
+  assert.equal(session.clipboard.latestRemoteText, "Second remote copy");
+});

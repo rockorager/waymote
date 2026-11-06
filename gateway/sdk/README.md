@@ -82,6 +82,12 @@ When the remote desktop runs macOS, pass `remotePlatform: "macos"` so the paste
 gesture taps Command-V (Command-Shift-V with Shift) on the remote instead. The
 default, `"linux"`, uses Ctrl-V.
 
+With `clipboardAutoSync: true` in `attachSurface`, new remote copies are
+written to the host clipboard while the page has focus. The gateway replays its
+latest clipboard whenever it grants control; that replay updates
+`session.clipboard.latestRemoteText` and the `clipboard` event but is not
+written, so focusing the desktop to paste never replaces a fresh host copy.
+
 Audio must be enabled from a user gesture with `session.audio.enable()`. The
 package includes its AudioWorklet beside the SDK module; `audioWorkletURL` can
 override that URL when an application's bundler or content policy requires a
