@@ -517,12 +517,20 @@ function handlePaste(event) {
   // has exactly one route to the remote application.
   event.preventDefault();
   event.stopPropagation();
-  const modifiers = clipboardPasteModifiers ?? [29];
+  const modifiers = clipboardPasteModifiers ?? [remotePasteModifier()];
   clipboardPasteModifiers = null;
   physicalTextPending = false;
   const text = event.clipboardData?.getData("text/plain");
   if (!text && !event.clipboardData?.types.includes("text/plain")) return;
   pasteClipboardText(text, modifiers);
+}
+
+// The modifier of the remote desktop's own paste shortcut: Command (Linux key
+// code 125, Super) on a macOS remote and Ctrl (29) on a Linux one. Tapping the
+// remote's native shortcut keeps the host's Command or Ctrl from leaking through
+// as the wrong key; Ctrl-V scrolls a page down in Cocoa text views.
+function remotePasteModifier() {
+  return options.remotePlatform === "macos" ? 125 : 29;
 }
 
 function pasteClipboardText(text, modifiers) {
@@ -1208,7 +1216,9 @@ function handleKeyDown(event) {
     if (event.repeat) {
       event.preventDefault();
     } else {
-      clipboardPasteModifiers = event.shiftKey ? [29, 42] : [29];
+      clipboardPasteModifiers = event.shiftKey
+        ? [remotePasteModifier(), 42]
+        : [remotePasteModifier()];
       // WebKit only performs native paste with an editable element focused.
       imeProxy.focus({ preventScroll: true });
     }
@@ -2251,6 +2261,10 @@ export class WaymoteSession {
   #disposePromise = null;
 
   constructor(options = {}) {
+    if (options.remotePlatform !== undefined &&
+        options.remotePlatform !== "linux" && options.remotePlatform !== "macos") {
+      throw new TypeError(`Unknown remote platform: ${options.remotePlatform}`);
+    }
     this.#remoteDisplayPolicy = normalizeRemoteDisplayPolicy(
       options.remoteDisplay ?? { mode: "manual" },
     );

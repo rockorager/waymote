@@ -78,6 +78,10 @@ Shift uses Ctrl-Shift-V. Ctrl-V on macOS passes through to the remote applicatio
 without reading the local clipboard. Native paste does not request clipboard-read
 permission.
 
+When the remote desktop runs macOS, pass `remotePlatform: "macos"` so the paste
+gesture taps Command-V (Command-Shift-V with Shift) on the remote instead. The
+default, `"linux"`, uses Ctrl-V.
+
 Audio must be enabled from a user gesture with `session.audio.enable()`. The
 package includes its AudioWorklet beside the SDK module; `audioWorkletURL` can
 override that URL when an application's bundler or content policy requires a

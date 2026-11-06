@@ -1257,3 +1257,58 @@ test("a click is not followed by a motion queued against an earlier layout", asy
   animationFrames.shift()();
   assert.deepEqual(messages(), [["motion", 32768, 32768], ["button", 0x110, 1]]);
 });
+
+test("a macOS remote pastes with its own Command-V shortcut", async (t) => {
+  await t.test("from Command-V on a Mac host", async (t) => {
+    const { keyEvent, paste, messages } = await controlledSession(t, {
+      platform: "MacIntel", remotePlatform: "macos",
+    });
+    keyEvent("keydown", "MetaLeft", { metaKey: true });
+    keyEvent("keydown", "KeyV", { metaKey: true });
+    paste("for the Mac");
+    keyEvent("keyup", "MetaLeft");
+    // Command is the remote paste modifier, so it stays held through the tap.
+    assert.deepEqual(messages(), [
+      [125, 1], { type: "clipboard-write", text: "for the Mac" },
+      [125, 1], [47, 1], [47, 0], [125, 0],
+    ]);
+  });
+
+  await t.test("from Ctrl-V on a Linux host", async (t) => {
+    const { keyEvent, paste, messages } = await controlledSession(t, { remotePlatform: "macos" });
+    keyEvent("keydown", "ControlLeft", { ctrlKey: true });
+    keyEvent("keydown", "KeyV", { ctrlKey: true });
+    paste("from Linux");
+    keyEvent("keyup", "KeyV");
+    keyEvent("keyup", "ControlLeft");
+    assert.deepEqual(messages(), [
+      [29, 1], { type: "clipboard-write", text: "from Linux" },
+      [29, 0], [125, 1], [47, 1], [47, 0], [125, 0], [29, 1], [29, 0],
+    ]);
+  });
+
+  await t.test("with Shift and from a menu paste", async (t) => {
+    const { keyEvent, paste, messages, control } = await controlledSession(t, {
+      platform: "MacIntel", remotePlatform: "macos",
+    });
+    keyEvent("keydown", "MetaLeft", { metaKey: true });
+    keyEvent("keydown", "ShiftLeft", { metaKey: true, shiftKey: true });
+    keyEvent("keydown", "KeyV", { metaKey: true, shiftKey: true });
+    control.sent.length = 0;
+    paste("plain text");
+    assert.deepEqual(messages(), [
+      { type: "clipboard-write", text: "plain text" }, [125, 1], [42, 1], [47, 1], [47, 0],
+    ]);
+    keyEvent("keyup", "ShiftLeft", { metaKey: true });
+    keyEvent("keyup", "MetaLeft");
+    control.sent.length = 0;
+    paste("menu");
+    assert.deepEqual(messages(), [
+      { type: "clipboard-write", text: "menu" }, [125, 1], [47, 1], [47, 0], [125, 0],
+    ]);
+  });
+});
+
+test("remote platforms other than linux and macos are rejected", () => {
+  assert.throws(() => new WaymoteSession({ remotePlatform: "darwin" }), /Unknown remote platform/);
+});

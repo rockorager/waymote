@@ -47,6 +47,12 @@ export interface WaymoteSessionOptions {
   readonly audioWorkletURL?: string | URL;
   /** Defaults to manual; local canvas sizing never implicitly changes this. */
   readonly remoteDisplay?: RemoteDisplayPolicy;
+  /**
+   * Operating system of the remote desktop. Defaults to linux. Selects the
+   * remote's own paste shortcut for the host's paste gesture: Command-V on a
+   * macOS remote and Ctrl-V on a Linux one.
+   */
+  readonly remotePlatform?: "linux" | "macos";
 }
 
 export interface VideoState {
