@@ -1136,6 +1136,9 @@ function handleRelativePointerMove(event) {
 }
 
 function handlePointerLockChange() {
+  // An absolute position queued before capture is stale once relative motion
+  // takes over; sending it would warp the remote cursor.
+  pendingPointerPosition = null;
   owner.updateState("input", { pointerLocked: document.pointerLockElement === display });
   if (document.pointerLockElement !== display) releaseInput();
 }
@@ -1146,6 +1149,9 @@ function handlePointerDown(event) {
   if ((!locked && !position) || event.button < 0 || event.button > 4) {
     return;
   }
+  // The press carries the current position. A queued motion event may have
+  // been measured against an earlier layout and must not follow it.
+  pendingPointerPosition = null;
   inputElement.focus({ preventScroll: true });
   if (!locked) inputElement.setPointerCapture(event.pointerId);
   if (position) {

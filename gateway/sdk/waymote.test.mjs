@@ -1105,3 +1105,155 @@ test("visibility changes replace every pending transport socket", async () => {
   await session.dispose();
   assert.ok(currentSockets.every((socket) => socket.closeCalls === 1));
 });
+
+async function controlledSession(t, { platform = "Linux x86_64", ...options } = {}) {
+  const navigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const navigator = { platform };
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: navigator });
+  t.after(() => {
+    if (navigatorDescriptor) Object.defineProperty(globalThis, "navigator", navigatorDescriptor);
+    else delete globalThis.navigator;
+  });
+  const fakeWindow = new FakeTarget();
+  fakeWindow.devicePixelRatio = 1;
+  fakeWindow.VideoDecoder = true;
+  const fakeDocument = new FakeTarget();
+  fakeDocument.hidden = false;
+  fakeDocument.pointerLockElement = null;
+  fakeDocument.hasFocus = () => true;
+  fakeDocument.exitPointerLock = () => { fakeDocument.pointerLockElement = null; };
+  globalThis.window = fakeWindow;
+  globalThis.document = fakeDocument;
+
+  class FakeWebSocket extends FakeTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+    readyState = FakeWebSocket.CONNECTING;
+    binaryType = "";
+    sent = [];
+    send(value) { this.sent.push(value); }
+    close() { this.readyState = FakeWebSocket.CLOSED; }
+  }
+  globalThis.WebSocket = FakeWebSocket;
+  const animationFrames = [];
+  globalThis.requestAnimationFrame = (callback) => animationFrames.push(callback);
+  globalThis.cancelAnimationFrame = () => {};
+
+  const sockets = new Map();
+  const canvas = new FakeTarget();
+  canvas.width = 1280;
+  canvas.height = 720;
+  canvas.bounds = { left: 0, top: 0, width: 1280, height: 720 };
+  canvas.getBoundingClientRect = () => canvas.bounds;
+  canvas.getContext = () => ({ drawImage() {} });
+  canvas.focus = () => {};
+  canvas.setPointerCapture = () => {};
+  const textInput = new FakeTarget();
+  textInput.value = "";
+  textInput.focus = () => {};
+  const session = new WaymoteSession({
+    endpoint: "https://desktop.example.com",
+    audio: false,
+    createWebSocket(path) {
+      const socket = new FakeWebSocket();
+      sockets.set(path, socket);
+      return socket;
+    },
+    ...options,
+  });
+  t.after(() => session.dispose());
+  session.attachSurface({ canvas, textInputElement: textInput, clipboardAutoSync: true });
+  session.connect();
+  await Promise.resolve();
+  await Promise.resolve();
+  session.input.acquire();
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const control = sockets.get("/control");
+  control.readyState = FakeWebSocket.OPEN;
+  control.dispatch("open", {});
+  const receive = (message) => control.dispatch("message", { data: JSON.stringify(message) });
+  receive({ type: "control-state", state: "active" });
+  control.sent.length = 0;
+
+  const keyEvent = (type, code, overrides = {}, target = canvas) => {
+    const event = {
+      code, key: "", ctrlKey: false, metaKey: false, altKey: false, shiftKey: false,
+      repeat: false, isComposing: false, keyCode: 0,
+      currentTarget: target,
+      getModifierState: () => false,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() {},
+      ...overrides,
+    };
+    target.dispatch(type, event);
+    return event;
+  };
+  const pointerEvent = (type, clientX, clientY, button = 0) => {
+    const event = {
+      clientX, clientY, button, pointerId: 1,
+      preventDefault() {},
+    };
+    canvas.dispatch(type, event);
+    return event;
+  };
+  const paste = (text, target = textInput) => {
+    const event = {
+      clipboardData: { types: ["text/plain"], getData: () => text },
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+      stopPropagation() {},
+    };
+    target.dispatch("paste", event);
+    return event;
+  };
+  const beforeInput = (data) => {
+    const event = {
+      inputType: "insertText", data, isComposing: false,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+    };
+    textInput.dispatch("beforeinput", event);
+    return event;
+  };
+  // Keyboard records become [key, state], other records name their type, and
+  // JSON messages are parsed.
+  const recordNames = { 1: "motion", 2: "button", 5: "release-all", 6: "resize" };
+  const messages = () => control.sent.map((record) => {
+    if (typeof record === "string") {
+      return record.startsWith("{") ? JSON.parse(record) : record;
+    }
+    const view = new DataView(record);
+    const type = view.getUint8(1);
+    if (type === 4) return [view.getUint32(4, true), view.getUint8(2)];
+    if (type === 1) return ["motion", view.getUint32(4, true), view.getUint32(8, true)];
+    if (type === 2) return ["button", view.getUint32(4, true), view.getUint8(2)];
+    return recordNames[type] ?? type;
+  });
+  return {
+    session, navigator, canvas, textInput, control, sockets, animationFrames,
+    receive, keyEvent, pointerEvent, paste, beforeInput, messages,
+  };
+}
+
+test("pointer capture discards a queued absolute position", async (t) => {
+  const { canvas, animationFrames, pointerEvent, messages } = await controlledSession(t);
+  pointerEvent("pointermove", 320, 180);
+  assert.equal(animationFrames.length, 1);
+  document.pointerLockElement = canvas;
+  document.dispatch("pointerlockchange", {});
+  animationFrames.shift()();
+  assert.deepEqual(messages(), []);
+});
+
+test("a click is not followed by a motion queued against an earlier layout", async (t) => {
+  const { canvas, animationFrames, pointerEvent, messages } = await controlledSession(t);
+  pointerEvent("pointermove", 320, 180);
+  canvas.bounds = { left: 640, top: 0, width: 640, height: 360 };
+  pointerEvent("pointerdown", 960, 180);
+  animationFrames.shift()();
+  assert.deepEqual(messages(), [["motion", 32768, 32768], ["button", 0x110, 1]]);
+});
