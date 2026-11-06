@@ -168,6 +168,12 @@ export interface AudioController {
 export interface InputController {
   acquire(): void;
   release(): void;
+  /**
+   * Swaps Command (Super) and Control for hardware keys, so a Mac browser's
+   * Command shortcuts reach a Linux desktop as Ctrl shortcuts and the reverse.
+   * Defaults to false.
+   */
+  setSwapCommandControl(enabled: boolean): void;
 }
 
 export interface ClipboardController {

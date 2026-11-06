@@ -72,6 +72,10 @@ do not need to select their local keyboard layout in the application. Ctrl,
 Meta, and ordinary Alt shortcuts remain physical-key shortcuts except for paste.
 The gateway's `-xkb-layout` setting remains the fallback for older browser clients.
 
+`session.input.setSwapCommandControl(true)` swaps Command (Super) and Control
+for hardware keys, so a Mac user's Command-C reaches a Linux desktop as Ctrl-C.
+The platform paste gesture keeps working either way.
+
 The browser's native paste shortcut (Command-V on Apple platforms, Ctrl-V
 elsewhere) sends local clipboard text and pastes remotely with Ctrl-V; adding
 Shift uses Ctrl-Shift-V. Ctrl-V on macOS passes through to the remote application

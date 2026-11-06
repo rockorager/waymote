@@ -1342,3 +1342,73 @@ test("clipboard replays after a control claim do not overwrite the host clipboar
   assert.deepEqual(written, ["First remote copy", "Second remote copy", "Second remote copy"]);
   assert.equal(session.clipboard.latestRemoteText, "Second remote copy");
 });
+
+test("Command and Control can be swapped for hardware keys", async (t) => {
+  await t.test("on both sides, toggled at runtime", async (t) => {
+    const { session, keyEvent, messages } = await controlledSession(t, { platform: "MacIntel" });
+    session.input.setSwapCommandControl(true);
+    for (const [code, flag] of [["MetaLeft", "metaKey"], ["MetaRight", "metaKey"],
+      ["ControlLeft", "ctrlKey"], ["ControlRight", "ctrlKey"]]) {
+      keyEvent("keydown", code, { [flag]: true });
+      keyEvent("keydown", "KeyT", { [flag]: true });
+      keyEvent("keyup", "KeyT", { [flag]: true });
+      keyEvent("keyup", code);
+    }
+    session.input.setSwapCommandControl(false);
+    keyEvent("keydown", "MetaLeft", { metaKey: true });
+    keyEvent("keyup", "MetaLeft");
+    assert.deepEqual(messages(), [
+      [29, 1], [20, 1], [20, 0], [29, 0],
+      [97, 1], [20, 1], [20, 0], [97, 0],
+      [125, 1], [20, 1], [20, 0], [125, 0],
+      [126, 1], [20, 1], [20, 0], [126, 0],
+      [125, 1], [125, 0],
+    ]);
+  });
+
+  await t.test("without leaving a held key pressed when toggled", async (t) => {
+    const { session, keyEvent, messages } = await controlledSession(t);
+    session.input.setSwapCommandControl(true);
+    keyEvent("keydown", "MetaLeft", { metaKey: true });
+    keyEvent("keydown", "ShiftLeft", { metaKey: true, shiftKey: true });
+    session.input.setSwapCommandControl(false);
+    keyEvent("keyup", "MetaLeft", { shiftKey: true });
+    keyEvent("keyup", "ShiftLeft");
+    assert.deepEqual(messages(), [[29, 1], [42, 1], [29, 0], [42, 0]]);
+  });
+
+  await t.test("for modifier flags without a tracked keydown", async (t) => {
+    const { session, keyEvent, messages, control } = await controlledSession(t, {
+      platform: "MacIntel",
+    });
+    session.input.setSwapCommandControl(true);
+    keyEvent("keydown", "KeyC", { metaKey: true, shiftKey: true });
+    keyEvent("keyup", "KeyC");
+    keyEvent("keydown", "KeyC", { ctrlKey: true, shiftKey: true });
+    keyEvent("keyup", "KeyC");
+    assert.deepEqual(messages(), [
+      [42, 1], [29, 1], [46, 1], [46, 0], [42, 0], [29, 0],
+      [125, 1], [42, 1], [46, 1], [46, 0], [125, 0], [42, 0],
+    ]);
+    control.sent.length = 0;
+    session.input.setSwapCommandControl(false);
+    keyEvent("keydown", "KeyC", { metaKey: true, shiftKey: true });
+    assert.deepEqual(messages(), [[42, 1], [125, 1], [46, 1], [46, 0], [42, 0], [125, 0]]);
+  });
+
+  await t.test("while the Mac paste gesture still pastes", async (t) => {
+    const { session, keyEvent, paste, messages } = await controlledSession(t, {
+      platform: "MacIntel",
+    });
+    session.input.setSwapCommandControl(true);
+    keyEvent("keydown", "MetaLeft", { metaKey: true });
+    keyEvent("keydown", "KeyV", { metaKey: true });
+    paste("swapped");
+    keyEvent("keyup", "MetaLeft");
+    // The swapped Command already is the Linux paste modifier, so nothing is released.
+    assert.deepEqual(messages(), [
+      [29, 1], { type: "clipboard-write", text: "swapped" },
+      [29, 1], [47, 1], [47, 0], [29, 0],
+    ]);
+  });
+});

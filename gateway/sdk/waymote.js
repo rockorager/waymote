@@ -229,6 +229,9 @@ const resizeRequests = new Map();
 let resizeState = "idle";
 const pressedKeys = new Set();
 const pressedButtons = new Set();
+// Swap Command (Super) and Control for hardware keys, for a host whose primary
+// shortcut modifier differs from the remote's (a Mac browser on a Linux desktop).
+let swapCommandControl = false;
 let physicalTextPending = false;
 let suppressCompositionText = null;
 let compositionTimer = null;
@@ -691,19 +694,52 @@ function shortcutModifiers(event) {
   const modifiers = [...pressedKeys].filter((key) =>
     key === 29 || key === 42 || key === 54 || key === 97 || key === 100 ||
     key === 125 || key === 126);
-  if (event.ctrlKey && !modifiers.some((key) => key === 29 || key === 97)) {
-    modifiers.push(29);
+  // Modifier flags the event carries without a tracked keydown map to the
+  // remote keys the same hardware keys would produce.
+  const controlKeys = [29, 97];
+  const commandKeys = [125, 126];
+  const [controlPair, commandPair] = swapCommandControl
+    ? [commandKeys, controlKeys]
+    : [controlKeys, commandKeys];
+  const has = (pair) => modifiers.some((key) => pair.includes(key));
+  if (event.ctrlKey && !has(controlPair)) {
+    modifiers.push(controlPair[0]);
   }
-  if (event.shiftKey && !modifiers.some((key) => key === 42 || key === 54)) {
+  if (event.shiftKey && !has([42, 54])) {
     modifiers.push(42);
   }
-  if (event.altKey && !modifiers.includes(56) && !modifiers.includes(100)) {
+  if (event.altKey && !has([56, 100])) {
     modifiers.push(56);
   }
-  if (event.metaKey && !modifiers.includes(125) && !modifiers.includes(126)) {
-    modifiers.push(125);
+  if (event.metaKey && !has(commandPair)) {
+    modifiers.push(commandPair[0]);
   }
   return modifiers;
+}
+
+// The remote key for a hardware key event, with Command and Control swapped
+// when requested.
+function hardwareKeyCode(event) {
+  const key = linuxKeyCodes.get(event.code);
+  if (key === undefined || !swapCommandControl) return key;
+  switch (key) {
+    case 29: return 125;
+    case 97: return 126;
+    case 125: return 29;
+    case 126: return 97;
+    default: return key;
+  }
+}
+
+function setSwapCommandControl(enabled) {
+  enabled = enabled === true;
+  if (enabled === swapCommandControl) return;
+  // A held Command or Control key would otherwise be released under the other
+  // remote key and stay pressed on the remote.
+  for (const key of [29, 97, 125, 126]) {
+    if (pressedKeys.delete(key)) sendControl(keyboardRecord(key, keyReleased));
+  }
+  swapCommandControl = enabled;
 }
 
 function tapRemoteKey(key, modifiers) {
@@ -1218,7 +1254,7 @@ function handleKeyDown(event) {
   if (event.isComposing || event.keyCode === 229) {
     return;
   }
-  const key = linuxKeyCodes.get(event.code);
+  const key = hardwareKeyCode(event);
   if (key === undefined) {
     return;
   }
@@ -1282,7 +1318,7 @@ function handleKeyUp(event) {
     return;
   }
   if (event.code === "KeyV") clipboardPasteModifiers = null;
-  const key = linuxKeyCodes.get(event.code);
+  const key = hardwareKeyCode(event);
   if (key === undefined) {
     return;
   }
@@ -2217,6 +2253,7 @@ return {
   sendClipboardText,
   setLatencyTarget,
   setMuted,
+  setSwapCommandControl,
   setVolume,
 };
 }
@@ -2345,6 +2382,10 @@ export class WaymoteSession {
       release: () => {
         this.#assertActive();
         this.#runtime.releaseControl();
+      },
+      setSwapCommandControl: (enabled) => {
+        this.#assertActive();
+        this.#runtime.setSwapCommandControl(enabled);
       },
     });
     this.clipboard = Object.freeze({
