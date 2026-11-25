@@ -13,18 +13,32 @@ if [[ -s /etc/resolv.conf ]] \
     printf '\n' | sudo tee -a /etc/resolv.conf >/dev/null
 fi
 
-sudo install -Dm0644 /dev/stdin /etc/apt/sources.list.d/waymote-trixie.sources <<'EOF'
+# Debian 13 marks its archive with the .pgp keyring and Debian 12 with .gpg;
+# apt refuses a second entry for the archive that names a different one.
+keyring=/usr/share/keyrings/debian-archive-keyring.pgp
+[[ -e "$keyring" ]] || keyring=/usr/share/keyrings/debian-archive-keyring.gpg
+codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-}")"
+# Debian 13 images already list trixie main; add only what they lack.
+components="main contrib"
+[[ "$codename" != trixie ]] || components=contrib
+sudo install -Dm0644 /dev/stdin /etc/apt/sources.list.d/waymote-trixie.sources <<EOF
 Types: deb
 URIs: https://deb.debian.org/debian
 Suites: trixie
-Components: main contrib
-Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+Components: $components
+Signed-By: $keyring
 EOF
-sudo install -Dm0644 /dev/stdin /etc/apt/preferences.d/waymote-trixie <<'EOF'
+# On older releases, use trixie only for packages installed with -t trixie. On
+# trixie itself the pin would demote the whole system release, so skip it.
+if [[ "$codename" == trixie ]]; then
+    sudo rm -f /etc/apt/preferences.d/waymote-trixie
+else
+    sudo install -Dm0644 /dev/stdin /etc/apt/preferences.d/waymote-trixie <<'EOF'
 Package: *
 Pin: release n=trixie
 Pin-Priority: 100
 EOF
+fi
 sudo apt-get update
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -t trixie \
     ca-certificates curl ffmpeg foot game-data-packager labwc libwayland-dev \
@@ -34,7 +48,7 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends -
 sudo install -Dm0644 /dev/stdin /etc/sysctl.d/90-waymote-rtp.conf <<'EOF'
 net.core.rmem_max = 8388608
 EOF
-sudo sysctl --system >/dev/null
+sudo sysctl -p /etc/sysctl.d/90-waymote-rtp.conf >/dev/null
 
 if ! dpkg-query -W -f='${Status}' quake3-demo-data 2>/dev/null | grep -q 'install ok installed'; then
     temporary="$(mktemp -d)"
