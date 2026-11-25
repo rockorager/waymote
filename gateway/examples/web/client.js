@@ -17,7 +17,11 @@ const copyClipboardButton = document.querySelector("#copy-clipboard");
 const clipboardStatus = document.querySelector("#clipboard-status");
 const imeProxy = document.querySelector("#ime-proxy");
 
+// A gateway started with WAYMOTE_TOKEN expects it as a WebSocket subprotocol.
+// Open the page as /#token=... so the token stays out of requests and logs.
+const token = new URLSearchParams(location.hash.slice(1)).get("token");
 const session = new WaymoteSession({
+  createWebSocket: token ? (_path, url) => new WebSocket(url, [token]) : undefined,
   latency: Number(latency.value),
   // Keep the shared demo at one resolution: multiple portal viewers can take
   // input control in turn, but must not repeatedly reconfigure one encoder.

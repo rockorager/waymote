@@ -137,13 +137,24 @@ The current implementation has been exercised primarily in Chromium on Linux.
 
 ## Security
 
-Waymote does not currently authenticate remote sessions. A production
-deployment must terminate TLS and enforce authentication in a trusted ingress
-or reverse proxy. Exposing the gateway without that boundary exposes input and
-clipboard control of the Wayland session.
+Waymote does not manage user accounts. A production deployment must terminate
+TLS and enforce authentication in a trusted ingress or reverse proxy. Exposing
+the gateway without that boundary exposes input and clipboard control of the
+Wayland session.
 
-Use the gateway's public-origin restriction to reject WebSocket connections
-from unexpected browser origins.
+Set `WAYMOTE_TOKEN` to require a shared secret on the video, audio, and
+control WebSockets. Browsers send it as a WebSocket subprotocol (see the SDK's
+`createWebSocket` option); other clients may send it as a bearer token. Use
+only letters, digits, and `-._~`, for example `openssl rand -hex 32`. The
+bundled example page reads it from the URL fragment, as in `/#token=...`. Set
+the token on any machine shared with other users, since anything that can reach
+the gateway's port can otherwise control the session.
+
+The gateway accepts WebSockets only when the request's Host is an IP address, a
+`localhost` name, or the host of `-public-url`, which defeats DNS rebinding.
+Behind a reverse proxy that forwards a domain name as the Host, set
+`-public-url` to that public URL. The same option also rejects WebSocket
+connections from unexpected browser origins.
 
 ## Current status
 

@@ -781,6 +781,60 @@ func TestControlConnectionsHandOffLeaseWithoutReconnect(t *testing.T) {
 	expectControlState(t, ctx, second, "active")
 }
 
+func TestControlRejectsRebindingHostsAndMissingToken(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	gateway := &gateway{
+		input: &inputBridge{}, clipboard: &clipboardBridge{},
+		publicHost: "desktop.example.test", token: "s3cret-token",
+	}
+	server := httptest.NewServer(http.HandlerFunc(gateway.control))
+	defer server.Close()
+	_, port, _ := strings.Cut(strings.TrimPrefix(server.URL, "http://"), ":")
+	cases := []struct {
+		name, host, origin string
+		protocols          []string
+		header             http.Header
+		status             int
+	}{
+		{"rebound domain with token", "attacker.example:" + port, "http://attacker.example:" + port, []string{"s3cret-token"}, nil, http.StatusForbidden},
+		{"public host suffix", "desktop.example.test.attacker.example", "", []string{"s3cret-token"}, nil, http.StatusForbidden},
+		{"loopback without token", "127.0.0.1:" + port, "", nil, nil, http.StatusUnauthorized},
+		{"loopback with wrong token", "127.0.0.1:" + port, "", []string{"s3cret-tokem"}, nil, http.StatusUnauthorized},
+		{"loopback with token prefix", "127.0.0.1:" + port, "", []string{"s3cret"}, nil, http.StatusUnauthorized},
+		{"loopback with subprotocol token", "127.0.0.1:" + port, "http://127.0.0.1:" + port, []string{"other", "s3cret-token"}, nil, http.StatusSwitchingProtocols},
+		{"localhost with bearer token", "localhost:" + port, "", nil, http.Header{"Authorization": {"Bearer s3cret-token"}}, http.StatusSwitchingProtocols},
+		{"IPv6 literal with token", "[::1]:" + port, "", []string{"s3cret-token"}, nil, http.StatusSwitchingProtocols},
+		{"public host with token", "Desktop.Example.Test", "https://desktop.example.test", []string{"s3cret-token"}, nil, http.StatusSwitchingProtocols},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			header := http.Header{}
+			if c.origin != "" {
+				header.Set("Origin", c.origin)
+			}
+			for key, values := range c.header {
+				header[key] = values
+			}
+			connection, response, err := websocket.Dial(ctx, "ws"+strings.TrimPrefix(server.URL, "http"), &websocket.DialOptions{
+				Host: c.host, HTTPHeader: header, Subprotocols: c.protocols,
+			})
+			if response == nil {
+				t.Fatalf("no response: %v", err)
+			}
+			if response.StatusCode != c.status {
+				t.Fatalf("status = %d, want %d (%v)", response.StatusCode, c.status, err)
+			}
+			if connection != nil {
+				if len(c.protocols) > 0 && connection.Subprotocol() != "s3cret-token" {
+					t.Fatalf("subprotocol = %q, want the token echoed", connection.Subprotocol())
+				}
+				connection.CloseNow()
+			}
+		})
+	}
+}
+
 type discardWriteCloser struct{}
 
 func (discardWriteCloser) Write(value []byte) (int, error) {

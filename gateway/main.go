@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/binary"
 	"encoding/json"
@@ -346,6 +347,8 @@ type gateway struct {
 	clipboard     *clipboardBridge
 	frameRate     uint64
 	allowedOrigin string
+	publicHost    string
+	token         string
 	fixedWidth    uint32
 	fixedHeight   uint32
 	nextClientID  atomic.Uint64
@@ -506,16 +509,74 @@ func (p *qualityPolicy) update(queue uint32, dropped uint64, rtt float64, now ti
 	return false
 }
 
-func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
-	clientID := g.nextClientID.Add(1)
+// accept upgrades a WebSocket request after checking that it names a host the
+// gateway serves, carries the session token when one is configured, and comes
+// from an allowed browser origin.
+func (g *gateway) accept(w http.ResponseWriter, r *http.Request) (*websocket.Conn, error) {
+	if !g.allowedHost(r.Host) {
+		http.Error(w, "host not allowed", http.StatusForbidden)
+		return nil, fmt.Errorf("host %q is not allowed", r.Host)
+	}
+	var subprotocols []string
+	if g.token != "" {
+		if !g.authorized(r) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return nil, errors.New("missing or invalid token")
+		}
+		// Browsers fail the handshake unless the server echoes a
+		// subprotocol the client offered.
+		subprotocols = []string{g.token}
+	}
 	originPatterns := []string(nil)
 	if g.allowedOrigin != "" {
 		originPatterns = []string{g.allowedOrigin}
 	}
-	connection, err := websocket.Accept(w, r, &websocket.AcceptOptions{
+	return websocket.Accept(w, r, &websocket.AcceptOptions{
 		CompressionMode: websocket.CompressionDisabled,
 		OriginPatterns:  originPatterns,
+		Subprotocols:    subprotocols,
 	})
+}
+
+// allowedHost rejects DNS-rebinding requests: a hostile page can point a name
+// it controls at the gateway's address, but cannot make the browser send an IP
+// literal, a localhost name, or the configured public host as the Host header.
+func (g *gateway) allowedHost(hostport string) bool {
+	host, _, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host = strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	return net.ParseIP(host) != nil ||
+		host == "localhost" || strings.HasSuffix(host, ".localhost") ||
+		g.publicHost != "" && host == g.publicHost
+}
+
+// authorized reports whether the request carries the session token, either as
+// a WebSocket subprotocol (the only credential browsers can attach) or as a
+// bearer token.
+func (g *gateway) authorized(r *http.Request) bool {
+	want := []byte(g.token)
+	candidates := []string{}
+	if bearer, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer "); ok {
+		candidates = append(candidates, bearer)
+	}
+	for _, header := range r.Header.Values("Sec-WebSocket-Protocol") {
+		for _, protocol := range strings.Split(header, ",") {
+			candidates = append(candidates, strings.TrimSpace(protocol))
+		}
+	}
+	for _, candidate := range candidates {
+		if subtle.ConstantTimeCompare([]byte(candidate), want) == 1 {
+			return true
+		}
+	}
+	return false
+}
+
+func (g *gateway) stream(w http.ResponseWriter, r *http.Request) {
+	clientID := g.nextClientID.Add(1)
+	connection, err := g.accept(w, r)
 	if err != nil {
 		log.Printf("video client %d rejected: %v", clientID, err)
 		return
@@ -642,14 +703,7 @@ func encodeAudioMessage(packet audioSample) []byte {
 
 func (g *gateway) streamAudio(w http.ResponseWriter, r *http.Request) {
 	clientID := g.nextClientID.Add(1)
-	originPatterns := []string(nil)
-	if g.allowedOrigin != "" {
-		originPatterns = []string{g.allowedOrigin}
-	}
-	connection, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		CompressionMode: websocket.CompressionDisabled,
-		OriginPatterns:  originPatterns,
-	})
+	connection, err := g.accept(w, r)
 	if err != nil {
 		log.Printf("audio client %d rejected: %v", clientID, err)
 		return
@@ -816,14 +870,7 @@ func (bridge *inputBridge) write(record []byte) error {
 
 func (g *gateway) control(w http.ResponseWriter, r *http.Request) {
 	clientID := g.nextClientID.Add(1)
-	originPatterns := []string(nil)
-	if g.allowedOrigin != "" {
-		originPatterns = []string{g.allowedOrigin}
-	}
-	connection, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		CompressionMode: websocket.CompressionDisabled,
-		OriginPatterns:  originPatterns,
-	})
+	connection, err := g.accept(w, r)
 	if err != nil {
 		log.Printf("control client %d rejected: %v", clientID, err)
 		return
@@ -1233,6 +1280,18 @@ func main() {
 	if err != nil {
 		log.Fatalf("invalid public-url: %v", err)
 	}
+	publicHost := ""
+	if allowedOrigin != "" {
+		parsed, _ := url.Parse(allowedOrigin)
+		publicHost = strings.ToLower(parsed.Hostname())
+	}
+	// The token comes only from the environment so it never appears in the
+	// process list, and is removed so the encoder does not inherit it.
+	token := os.Getenv("WAYMOTE_TOKEN")
+	os.Unsetenv("WAYMOTE_TOKEN")
+	if !validToken(token) {
+		log.Fatal("WAYMOTE_TOKEN may contain only letters, digits, and - . _ ~")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1264,6 +1323,8 @@ func main() {
 		clipboard:     clipboard,
 		frameRate:     *frameRate,
 		allowedOrigin: allowedOrigin,
+		publicHost:    publicHost,
+		token:         token,
 		fixedWidth:    uint32(*fixedWidth),
 		fixedHeight:   uint32(*fixedHeight),
 		quality: qualityPolicy{
@@ -1310,6 +1371,17 @@ func validXKBLayout(layout string) bool {
 	}
 	for _, c := range layout {
 		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// validToken limits tokens to characters that are valid in a WebSocket
+// subprotocol, where browsers carry them.
+func validToken(token string) bool {
+	for _, c := range token {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || strings.ContainsRune("-._~", c)) {
 			return false
 		}
 	}
